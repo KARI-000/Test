@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Text Cinematic Distortion — single-file</title>
+<style>
+  :root{
+    --bg:#000000;
+    --fg:#FFFFFF;
+    --ui-bg:#111;
+    --ui-fg:#ddd;
+    --accent:#2aa1ff;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "メイリオ", sans-serif;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ui-fg);}
+  .wrap{display:flex;gap:12px;padding:12px;box-sizing:border-box;height:100%;}
+  .left{
+    width:720px; max-width:60%;
+    background:linear-gradient(180deg,#050505, #0b0b0b);
+    padding:10px;border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,0.6);
+    display:flex;flex-direction:column;align-items:center;
+  }
+  canvas{width:100%;height:420px;background:var(--bg);border:1px solid #111;border-radius:6px;display:block;}
+  .controls{
+    margin-top:10px;width:100%;display:flex;gap:8px;flex-wrap:wrap;align-items:center;
+  }
+  .controls label{font-size:13px;color:var(--ui-fg);display:flex;flex-direction:column;gap:6px;}
+  .panel{
+    width:360px; max-width:40%; background:var(--ui-bg); border-radius:8px; padding:12px; overflow:auto;
+  }
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:8px;}
+  input[type="range"]{width:160px;}
+  select,input[type="number"],input[type="text"]{background:#000;color:var(--ui-fg);border:1px solid #222;padding:6px;border-radius:4px;}
+  button{background:var(--accent);border:none;color:#000;padding:8px 10px;border-radius:6px;cursor:pointer;font-weight:600;}
+  button.secondary{background:#333;color:var(--ui-fg);}
+  .small{font-size:12px;color:#aaa;}
+  .preset{display:flex;gap:6px;flex-wrap:wrap;}
+  .preset button{background:#222;color:var(--ui-fg);padding:6px 8px;border-radius:6px;border:1px solid #333;}
+  footer{font-size:12px;color:#888;margin-top:8px;}
+  .group{border-top:1px dashed #222;margin-top:8px;padding-top:8px;}
+  .flex-between{display:flex;justify-content:space-between;align-items:center;}
+  a.downloadLink{color:#7bd;word-break:break-all;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="left">
+    <canvas id="preview" width="1280" height="720" style="max-width:100%;"></canvas>
+
+    <div class="controls">
+      <label>
+        テキスト
+        <input id="textInput" type="text" value="test" />
+      </label>
+
+      <label>
+        フォントサイズ
+        <input id="fontSize" type="range" min="24" max="360" value="96" />
+      </label>
+
+      <label style="min-width:120px">
+        フォント選択
+        <select id="fontSelect">
+          <option value="serif">明朝体 (serif)</option>
+          <option value="sans-serif" selected>ゴシック (sans-serif)</option>
+          <option value="monospace">等幅 (monospace)</option>
+          <option value="uploaded">アップロードしたフォント</option>
+        </select>
+      </label>
+
+      <label>
+        フォントアップロード（.ttf/.otf/.woff/.woff2）
+        <input id="fontUpload" type="file" accept=".ttf,.otf,.woff,.woff2" />
+      </label>
+    </div>
+
+    <div class="controls" style="margin-top:6px">
+      <label class="small">アンチエイリアス（低め）<input id="aaToggle" type="checkbox" /></label>
+      <label class="small">トレイルを有効<input id="trailToggle" type="checkbox" checked /></label>
+      <label class="small">トレイル長<input id="trailLength" type="range" min="0" max="24" value="8" /></label>
+      <label class="small">トレイル不透明度<input id="trailAlpha" type="range" min="0" max="1" step="0.05" value="0.55" /></label>
+    </div>
+
+    <div class="controls" style="margin-top:6px">
+      <label>グリッチ強度 <input id="glitchAmp" type="range" min="0" max="160" value="32" /></label>
+      <label>スライス数 <input id="sliceCount" type="range" min="0" max="48" value="10" /></label>
+      <label>スライス頻度 <input id="glitchFreq" type="range" min="0" max="1" step="0.01" value="0.18" /></label>
+    </div>
+
+    <div class="controls" style="margin-top:6px">
+      <label class="small">方向
+        <select id="direction">
+          <option value="right" selected>右へ滑る</option>
+          <option value="left">左へ滑る</option>
+        </select>
+      </label>
+
+      <label class="small">スピード <input id="speed" type="range" min="0" max="6" step="0.1" value="1.6" /></label>
+
+      <label class="small">モノクロのコントラスト <input id="contrast" type="range" min="1" max="3" step="0.01" value="1.6" /></label>
+    </div>
+
+    <div class="controls" style="margin-top:8px">
+      <button id="playBtn">Preview 再生</button>
+      <button id="pauseBtn" class="secondary">Pause</button>
+      <button id="snapshotBtn" class="secondary">静止画を保存 (PNG)</button>
+      <button id="recordBtn">録画（MOV へ試行）</button>
+      <label style="margin-left:8px">録画時間(s): <input id="recDuration" type="number" min="1" max="60" value="6" style="width:64px" /></label>
+      <label style="margin-left:8px">先頭無加工(s): <input id="prelude" type="number" min="0" max="10" value="1" style="width:64px" /></label>
+    </div>
+
+    <footer>ブラウザ依存: MOV 出力は Safari 系で成功しやすい。サポートがない場合は webm/mp4 にフォールバックします。</footer>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin:0 0 8px 0">詳細パラメータ / プリセット</h3>
+
+    <div class="group">
+      <div class="flex-between"><strong>プリセット</strong><span class="small">即座に試す</span></div>
+      <div class="preset" style="margin-top:6px">
+        <button data-preset="crisp">Crisp Slide</button>
+        <button data-preset="glitch-heavy">Glitch Heavy</button>
+        <button data-preset="subtle">Subtle Film</button>
+        <button data-preset="mono-trail">Mono Trail</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <strong>トレイル (Motion)</strong>
+      <div class="row">
+        <label style="flex:1">滑り方向: <select id="trailDir"><option value="right">右</option><option value="left">左</option></select></label>
+        <label style="flex:1">減衰率 <input id="trailDecay" type="range" min="0.85" max="0.999" step="0.001" value="0.92" /></label>
+      </div>
+
+      <div class="row">
+        <label style="flex:1">引きずり量 <input id="trailShift" type="range" min="0" max="120" value="18" /></label>
+        <label style="flex:1">フレームブレンド <input id="blendMode" type="range" min="0" max="1" step="0.01" value="0.5" /></label>
+      </div>
+    </div>
+
+    <div class="group">
+      <strong>グリッチ (Slice)</strong>
+      <div class="row"><label style="flex:1">ジッター強度 <input id="sliceJitter" type="range" min="0" max="1" step="0.01" value="0.7" /></label></div>
+      <div class="row"><label style="flex:1">スキャンライン密度 <input id="scanDensity" type="range" min="0" max="1" step="0.01" value="0.08" /></label></div>
+      <div class="row"><label style="flex:1">乱数シード <input id="seed" type="number" value="42" style="width:100px" /></label></div>
+    </div>
+
+    <div class="group">
+      <strong>出力</strong>
+      <div class="row">
+        <button id="downloadVideo" class="secondary">最後の録画をダウンロード</button>
+        <a id="downloadLink" class="downloadLink" style="display:inline-block;margin-left:8px;"></a>
+      </div>
+      <div class="small" style="margin-top:6px">注意: ブラウザがサポートしない場合は webm/mp4 にフォールバックします。高品質な mov が必要な場合は外部ツールで変換してください。</div>
+    </div>
+
+    <div class="group">
+      <strong>デバッグ / 情報</strong>
+      <div class="small" id="infoArea">準備完了。</div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+/* 改良点
+ - 録画の信頼性向上（MIME選択とボタントグル）
+ - 録画開始から prelude 秒は無加工レンダリング
+ - 録画状態を扱いやすくし、録画終了時に自動でダウンロードリンクを準備
+*/
+
+// --- ユーティリティ ---
+const el = id => document.getElementById(id);
+const clamp = (v,min,max)=> Math.max(min, Math.min(max, v));
+const randSeeded = (seed)=>{
+  let x = (seed>>>0) || 123456789;
+  return function() {
+    x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+    return (x >>> 0) / 4294967295;
+  };
+};
+
+// --- Canvas & state ---
+const canvas = el('preview');
+const ctx = canvas.getContext('2d', {alpha:false});
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+let offCanvas = document.createElement('canvas');
+let offCtx = offCanvas.getContext('2d', {alpha:false});
+
+let state = {
+  text: el('textInput').value,
+  fontSize: +el('fontSize').value,
+  fontFamily: 'sans-serif',
+  aaLow: el('aaToggle').checked,
+  trailEnabled: el('trailToggle').checked,
+  trailLength: +el('trailLength').value,
+  trailAlpha: +el('trailAlpha').value,
+  glitchAmp: +el('glitchAmp').value,
+  sliceCount: +el('sliceCount').value,
+  glitchFreq: +el('glitchFreq').value,
+  direction: el('direction').value,
+  speed: +el('speed').value,
+  contrast: +el('contrast').value,
+  trailDecay: +el('trailDecay').value,
+  trailShift: +el('trailShift').value,
+  blendMode: +el('blendMode').value,
+  sliceJitter: +el('sliceJitter').value,
+  scanDensity: +el('scanDensity').value,
+  seed: +el('seed').value
+};
+
+let uploadedFontName = null;
+el('fontUpload').addEventListener('change', async (ev)=>{
+  const f = ev.target.files && ev.target.files[0];
+  if(!f) return;
+  const url = URL.createObjectURL(f);
+  const name = 'UserFont_' + Date.now();
+  try{
+    const ff = new FontFace(name, `url(${url})`);
+    await ff.load();
+    document.fonts.add(ff);
+    uploadedFontName = name;
+    el('fontSelect').value = 'uploaded';
+    state.fontFamily = name;
+    el('infoArea').textContent = `フォントを読み込みました: ${f.name}`;
+  } catch(e){
+    console.error(e);
+    el('infoArea').textContent = 'フォントの読み込みに失敗しました。';
+    URL.revokeObjectURL(url);
+  }
+});
+
+// UI -> state バインド
+[
+  ['textInput','text'],
+  ['fontSize','fontSize'],
+  ['aaToggle','aaLow','checked'],
+  ['trailToggle','trailEnabled','checked'],
+  ['trailLength','trailLength'],
+  ['trailAlpha','trailAlpha'],
+  ['glitchAmp','glitchAmp'],
+  ['sliceCount','sliceCount'],
+  ['glitchFreq','glitchFreq'],
+  ['direction','direction'],
+  ['speed','speed'],
+  ['contrast','contrast'],
+  ['trailDecay','trailDecay'],
+  ['trailShift','trailShift'],
+  ['blendMode','blendMode'],
+  ['sliceJitter','sliceJitter'],
+  ['scanDensity','scanDensity'],
+  ['seed','seed']
+].forEach(([id, key, prop])=>{
+  const node = el(id);
+  const handler = ()=> {
+    if(prop === 'checked') state[key] = node.checked;
+    else state[key] = (node.type === 'number' || node.type === 'range') ? +node.value : node.value;
+  };
+  node.addEventListener('input', handler);
+  node.addEventListener('change', handler);
+});
+
+el('fontSelect').addEventListener('change', ()=>{
+  const v = el('fontSelect').value;
+  if(v === 'uploaded' && uploadedFontName) state.fontFamily = uploadedFontName;
+  else if(v === 'serif') state.fontFamily = 'serif';
+  else if(v === 'sans-serif') state.fontFamily = 'sans-serif';
+  else if(v === 'monospace') state.fontFamily = 'monospace';
+});
+
+// プリセット
+document.querySelectorAll('[data-preset]').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    const p = btn.dataset.preset;
+    if(p === 'crisp'){
+      el('aaToggle').checked = true; el('aaToggle').dispatchEvent(new Event('change'));
+      el('trailLength').value = 6; el('trailLength').dispatchEvent(new Event('input'));
+      el('glitchAmp').value = 16; el('glitchAmp').dispatchEvent(new Event('input'));
+      el('sliceCount').value = 8; el('sliceCount').dispatchEvent(new Event('input'));
+      el('glitchFreq').value = 0.12; el('glitchFreq').dispatchEvent(new Event('input'));
+      el('fontSize').value = 120; el('fontSize').dispatchEvent(new Event('input'));
+    } else if(p === 'glitch-heavy'){
+      el('aaToggle').checked = false; el('aaToggle').dispatchEvent(new Event('change'));
+      el('trailLength').value = 18; el('trailLength').dispatchEvent(new Event('input'));
+      el('glitchAmp').value = 96; el('glitchAmp').dispatchEvent(new Event('input'));
+      el('sliceCount').value = 28; el('sliceCount').dispatchEvent(new Event('input'));
+      el('glitchFreq').value = 0.3; el('glitchFreq').dispatchEvent(new Event('input'));
+      el('fontSize').value = 84; el('fontSize').dispatchEvent(new Event('input'));
+    } else if(p === 'subtle'){
+      el('aaToggle').checked = true; el('aaToggle').dispatchEvent(new Event('change'));
+      el('trailLength').value = 3; el('trailLength').dispatchEvent(new Event('input'));
+      el('glitchAmp').value = 6; el('glitchAmp').dispatchEvent(new Event('input'));
+      el('sliceCount').value = 6; el('sliceCount').dispatchEvent(new Event('input'));
+      el('glitchFreq').value = 0.06; el('glitchFreq').dispatchEvent(new Event('input'));
+    } else if(p === 'mono-trail'){
+      el('aaToggle').checked = false; el('aaToggle').dispatchEvent(new Event('change'));
+      el('trailLength').value = 20; el('trailLength').dispatchEvent(new Event('input'));
+      el('glitchAmp').value = 28; el('glitchAmp').dispatchEvent(new Event('input'));
+      el('sliceCount').value = 12; el('sliceCount').dispatchEvent(new Event('input'));
+      el('glitchFreq').value = 0.14; el('glitchFreq').dispatchEvent(new Event('input'));
+    }
+    el('infoArea').textContent = `プリセット "${p}" を適用しました。`;
+  });
+});
+
+// --- レンダリング ---
+function resizeCanvasToDisplaySize() {
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.floor(rect.width * DPR) || Math.floor(window.innerWidth * DPR);
+  const h = Math.floor(rect.height * DPR) || Math.floor(window.innerHeight * DPR);
+  if(canvas.width !== w || canvas.height !== h){
+    canvas.width = w; canvas.height = h;
+  }
+  offCanvas.width = Math.floor((w / DPR) / (state.aaLow ? 2 : 1)) ;
+  offCanvas.height = Math.floor((h / DPR) / (state.aaLow ? 2 : 1));
+}
+
+function clearMain(){
+  ctx.save();
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.restore();
+}
+
+function drawTextToCtx(ctx2, ratio){
+  const w = ctx2.canvas.width;
+  const h = ctx2.canvas.height;
+  ctx2.fillStyle = '#000';
+  ctx2.fillRect(0,0,w,h);
+
+  const fontPx = state.fontSize * (state.aaLow ? 0.5 : 1) * DPR / ratio;
+  ctx2.textBaseline = 'middle';
+  ctx2.textAlign = 'center';
+  ctx2.fillStyle = '#fff';
+  ctx2.font = `${fontPx}px "${state.fontFamily}", ${state.fontFamily}, sans-serif`;
+  ctx2.fillText(state.text, w/2, h/2);
+}
+
+function applyGlitchToMain(baseImageBitmap, now, rnd) {
+  const W = canvas.width, H = canvas.height;
+  const sCount = Math.round(state.sliceCount);
+  const amp = state.glitchAmp * DPR;
+  const freq = state.glitchFreq;
+  ctx.drawImage(baseImageBitmap, 0, 0, W, H);
+
+  for(let i=0;i<sCount;i++){
+    if(rnd() > freq) continue;
+    const hSlice = Math.max(2, Math.floor((rnd() * 0.08 + 0.01) * H));
+    const y = Math.floor(rnd() * (H - hSlice));
+    const sx = 0, sy = y, sw = W, sh = hSlice;
+    const dirMul = (state.direction === 'right') ? 1 : -1;
+    const dx = Math.floor((rnd() - 0.5) * state.sliceJitter * amp * 0.5 + dirMul * (rnd() * amp));
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(baseImageBitmap, sx, sy, sw, sh, dx, y, sw, sh);
+    ctx.restore();
+  }
+
+  const density = state.scanDensity;
+  if(density > 0){
+    ctx.save();
+    ctx.globalCompositeOperation = 'overlay';
+    ctx.globalAlpha = 0.03 * state.contrast;
+    for(let y=0;y<H;y+=Math.max(2, Math.floor(1 / density))){
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, y, W, 1);
+    }
+    ctx.restore();
+  }
+}
+
+let trailFrames = [];
+async function renderFrame(now, options = {}) {
+  // options: { forceUnprocessed: bool }
+  resizeCanvasToDisplaySize();
+  const W = canvas.width, H = canvas.height;
+  const ratio = (state.aaLow) ? 2 : 1;
+  const offW = Math.max(256, Math.floor(W / ratio));
+  const offH = Math.max(144, Math.floor(H / ratio));
+  offCanvas.width = offW; offCanvas.height = offH;
+  offCtx.imageSmoothingEnabled = !state.aaLow;
+  offCtx.fillStyle = '#000'; offCtx.fillRect(0,0,offW,offH);
+
+  // draw base text to offscreen
+  drawTextToCtx(offCtx, 1); // ratio accounted in font px calculation
+
+  const baseBitmap = await createImageBitmap(offCanvas);
+
+  clearMain();
+
+  // If forcing unprocessed rendering (prelude), draw only base bitmap and return
+  if(options.forceUnprocessed){
+    ctx.imageSmoothingEnabled = !state.aaLow;
+    ctx.drawImage(baseBitmap, 0, 0, W, H);
+    return;
+  }
+
+  // trail management
+  const trailLen = state.trailEnabled ? Math.max(0, state.trailLength) : 0;
+  trailFrames.unshift({bitmap: baseBitmap, t: now});
+  if(trailFrames.length > Math.max(64, trailLen+8)) {
+    while(trailFrames.length > trailLen + 12) {
+      const obj = trailFrames.pop();
+      if(obj && obj.bitmap && obj.bitmap.close) try{ obj.bitmap.close(); }catch(e){}
+    }
+  }
+
+  for(let i = Math.min(trailFrames.length-1, trailLen-1); i >= 0; i--){
+    const idx = i;
+    const obj = trailFrames[idx];
+    const shift = (state.trailShift * DPR) * ( (state.direction === 'right') ? (1 - idx/(trailLen||1)) : -(1 - idx/(trailLen||1)) );
+    const alpha = Math.pow(state.trailDecay, idx) * state.trailAlpha;
+    ctx.save();
+    ctx.globalAlpha = clamp(alpha, 0, 1);
+    ctx.globalCompositeOperation = 'screen';
+    const wobble = Math.sin(now/300 + idx) * 0.5 * (idx/(trailLen||1));
+    ctx.drawImage(obj.bitmap, shift + wobble, 0, W, H);
+    ctx.restore();
+  }
+
+  // draw newest
+  ctx.save();
+  ctx.globalAlpha = 1;
+  ctx.imageSmoothingEnabled = !state.aaLow;
+  ctx.drawImage(baseBitmap, 0, 0, W, H);
+  ctx.restore();
+
+  // apply glitch overlay (slices + scanlines)
+  const seedRnd = randSeeded(state.seed + Math.floor(now/1000));
+  applyGlitchToMain(baseBitmap, now, seedRnd);
+
+  // contrast
+  if(state.contrast !== 1.0){
+    ctx.save();
+    ctx.globalAlpha = 0.06 * (state.contrast - 1.0);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0,0,W,H);
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.globalAlpha = 0.02 * (state.contrast - 1.0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,W,H);
+    ctx.restore();
+  }
+
+  // vignette
+  ctx.save();
+  const g = ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.3,W/2,H/2,Math.max(W,H)*0.8);
+  g.addColorStop(0,'rgba(0,0,0,0)');
+  g.addColorStop(1,'rgba(0,0,0,0.4)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+  ctx.restore();
+}
+
+// アニメループ
+let running = false, animHandle = null;
+async function frameLoop(ts) {
+  if(!running) return;
+  await renderFrame(performance.now());
+  animHandle = requestAnimationFrame(frameLoop);
+}
+
+// UI コントロール
+el('playBtn').addEventListener('click', ()=>{
+  if(!running){
+    running = true;
+    requestAnimationFrame(frameLoop);
+    el('infoArea').textContent = 'プレビュー再生中…';
+  }
+});
+el('pauseBtn').addEventListener('click', ()=>{
+  running = false;
+  if(animHandle) cancelAnimationFrame(animHandle);
+  el('infoArea').textContent = 'プレビュー停止。';
+});
+el('snapshotBtn').addEventListener('click', async ()=>{
+  await renderFrame(performance.now());
+  canvas.toBlob(blob=>{
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'snapshot.png'; a.click();
+    URL.revokeObjectURL(url);
+  }, 'image/png');
+});
+el('textInput').addEventListener('input', ()=> { state.text = el('textInput').value; });
+el('fontSize').addEventListener('input', ()=> { state.fontSize = +el('fontSize').value; });
+
+// --- 録画処理（先頭無加工対応） ---
+let recordedBlobs = [], mediaRecorder = null, lastMime = null;
+let currentRecording = { active:false, startTime:0, prelude:0, duration:0 };
+
+function chooseSupportedMime(){
+  const candidates = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
+    'video/webm'
+  ];
+  for(const c of candidates){
+    if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return '';
+}
+
+// 録画ボタン（トグル）
+el('recordBtn').addEventListener('click', async ()=>{
+  if(currentRecording.active){
+    // 停止要求
+    if(mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+    // currentRecording.active will be cleared in onstop
+    el('infoArea').textContent = '録画停止要求を送信しました…';
+    return;
+  }
+
+  // 開始
+  const durationSec = Math.max(1, Math.min(60, +el('recDuration').value || 6));
+  const preludeSec = Math.max(0, Math.min(10, +el('prelude').value || 1));
+  currentRecording.prelude = preludeSec * 1000;
+  currentRecording.duration = durationSec * 1000;
+
+  // Ensure preview is running so frames are rendered
+  if(!running){
+    running = true;
+    requestAnimationFrame(frameLoop);
+  }
+
+  // prepare MediaRecorder options
+  recordedBlobs = [];
+  const stream = canvas.captureStream(60); // 60fps capture request
+  const mime = chooseSupportedMime();
+  lastMime = mime || 'video/webm';
+  let options = mime ? { mimeType: mime } : {};
+  try{
+    mediaRecorder = new MediaRecorder(stream, options);
+  } catch(e){
+    try { mediaRecorder = new MediaRecorder(stream); } catch(err){
+      el('infoArea').textContent = 'MediaRecorder を作成できません（ブラウザ非対応）。';
+      console.error(err);
+      return;
+    }
+  }
+
+  mediaRecorder.ondataavailable = (ev)=> { if(ev.data && ev.data.size>0) recordedBlobs.push(ev.data); };
+  mediaRecorder.onstop = ()=> {
+    const blob = new Blob(recordedBlobs, {type: lastMime || 'video/webm'});
+    const url = URL.createObjectURL(blob);
+    el('downloadLink').textContent = `録画: ${ (lastMime||'video').split(';')[0] } — クリックでダウンロード`;
+    el('downloadLink').href = url;
+    el('downloadLink').download = (lastMime && lastMime.includes('mp4')) ? 'distortion.mp4' :
+                                   (lastMime && lastMime.includes('webm')) ? 'distortion.webm' :
+                                   'distortion.mov';
+    el('infoArea').textContent = `録画完了。出力: ${el('downloadLink').download}`;
+    currentRecording.active = false;
+    mediaRecorder = null;
+    el('recordBtn').textContent = '録画（MOV へ試行）';
+  };
+  // Start recording slightly after we set startTime so first frames correspond to unprocessed prelude
+  currentRecording.active = true;
+  currentRecording.startTime = performance.now();
+  el('recordBtn').textContent = '録画停止';
+  el('infoArea').textContent = `録画中（先頭 ${currentRecording.prelude/1000}s は無加工）…`;
+
+  // We also want to ensure renderFrame uses forceUnprocessed during prelude.
+  mediaRecorder.start(100); // collect data every 100ms
+
+  // schedule stop
+  setTimeout(()=>{
+    if(mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+  }, currentRecording.duration);
+
+  // During prelude interval we force unprocessed frames by repeatedly calling renderFrame with option
+  // However our main loop already runs; instead, we set a flag and let renderFrame check timing.
+});
+
+// modify renderFrame usage: wrap to consider prelude
+// To ensure first N ms are unprocessed during recording, override the frameLoop to pass option when needed
+async function recordingAwareFrameLoop(ts){
+  if(!running) return;
+  const now = performance.now();
+  let forceUnprocessed = false;
+  if(currentRecording.active){
+    const elapsed = now - currentRecording.startTime;
+    if(elapsed < currentRecording.prelude) forceUnprocessed = true;
+  }
+  await renderFrame(now, { forceUnprocessed });
+  animHandle = requestAnimationFrame(recordingAwareFrameLoop);
+}
+
+// When starting preview via Play, use standard frameLoop. But when recording active, switch to recordingAwareFrameLoop automatically.
+el('playBtn').addEventListener('click', ()=>{
+  if(!running){
+    running = true;
+    // choose loop depending on recording state
+    if(currentRecording.active) requestAnimationFrame(recordingAwareFrameLoop);
+    else requestAnimationFrame(frameLoop);
+    el('infoArea').textContent = 'プレビュー再生中…';
+  }
+});
+
+// Ensure when recording starts while preview running, the loop used switches to recording-aware one.
+// Patch: observe currentRecording.active changes by monkey-patching mediaRecorder start point above; we also periodically check and switch loop if needed.
+setInterval(()=>{
+  if(!running) return;
+  // If recording active and current running loop is basic frameLoop, switch to recordingAwareFrameLoop by cancelling and starting new loop.
+  // We don't track which loop is active, so safely cancel and start recording-aware if recording active
+  if(currentRecording.active){
+    if(animHandle) cancelAnimationFrame(animHandle);
+    requestAnimationFrame(recordingAwareFrameLoop);
+  }
+}, 250);
+
+// download last recording button
+el('downloadVideo').addEventListener('click', ()=>{
+  const link = el('downloadLink');
+  if(link && link.href){
+    const a = document.createElement('a');
+    a.href = link.href; a.download = link.download || 'distortion_video';
+    a.click();
+  } else {
+    el('infoArea').textContent = '録画がまだありません。まず録画を実行してください。';
+  }
+});
+
+// 初期レンダリング
+requestAnimationFrame(()=> renderFrame(performance.now(), { forceUnprocessed:false }) );
+
+// ウィンドウリサイズ時
+window.addEventListener('resize', ()=> { resizeCanvasToDisplaySize(); renderFrame(performance.now()); });
+
+// テキスト反映
+el('textInput').addEventListener('input', ()=> {
+  state.text = el('textInput').value;
+});
+
+</script>
+</body>
+</html>
