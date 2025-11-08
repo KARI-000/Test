@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>visualizer</title>
+<style>
+  :root{color-scheme: dark}
+  body{background:#070707;color:#eee;font-family:system-ui,"Meiryo",sans-serif;margin:0;padding:18px;display:flex;flex-direction:column;align-items:center;gap:12px}
+  h1{margin:0 0 6px 0;font-size:20px}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  input[type=file]{background:#111;border:1px solid #222;color:#eee;padding:6px;border-radius:6px}
+  button,select,input[type=range]{background:#111;border:1px solid #222;color:#eee;padding:6px 10px;border-radius:6px;cursor:pointer}
+  canvas{background:#000;border:1px solid #222;max-width:100%;height:auto;display:block}
+  small{color:#9aa}
+</style>
+</head>
+<body>
+  <h1>visualizer</h1>
+
+  <div class="controls">
+    <input id="fileInput" type="file" accept=".wav,audio/*">
+    <button id="playBtn" disabled>再生</button>
+    <button id="recordBtn" disabled>録画開始</button>
+    <button id="stopBtn" disabled>停止</button>
+    <label>FPS
+      <select id="fps"><option>30</option><option selected>60</option></select>
+    </label>
+    <label>振幅
+      <input id="scale" type="range" min="20" max="800" value="200">
+    </label>
+    <label>線幅
+      <input id="lineWidth" type="range" min="1" max="6" value="2">
+    </label>
+  </div>
+
+  <small id="status">ファイルを選択してください（WAV推奨）。</small>
+
+  <canvas id="canvas" width="1920" height="1080"></canvas>
+
+<script>
+(() => {
+  const fileInput = document.getElementById('fileInput');
+  const playBtn   = document.getElementById('playBtn');
+  const recordBtn = document.getElementById('recordBtn');
+  const stopBtn   = document.getElementById('stopBtn');
+  const fpsSelect = document.getElementById('fps');
+  const scale     = document.getElementById('scale');
+  const lineWidth = document.getElementById('lineWidth');
+  const status    = document.getElementById('status');
+  const canvas    = document.getElementById('canvas');
+  const ctx       = canvas.getContext('2d');
+
+  let audioCtx = null;
+  let audioBuffer = null;
+  let playingSource = null;
+  let recordingSource = null;
+  let analyserL = null, analyserR = null;
+  let destForRecording = null;
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let rafId = null;
+  let animating = false;
+
+  function setStatus(s){ status.textContent = s; console.log(s); }
+  function ensureAudioCtx(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); return audioCtx; }
+
+  function createSource(opts={connectToDestination:true,connectToRecording:false}){
+    const ac = ensureAudioCtx();
+    const src = ac.createBufferSource();
+    src.buffer = audioBuffer;
+    analyserL = ac.createAnalyser();
+    analyserR = ac.createAnalyser();
+    analyserL.fftSize = analyserR.fftSize = 2048;
+    const splitter = ac.createChannelSplitter(2);
+    const gain = ac.createGain();
+    gain.gain.value = 1.0;
+    src.connect(gain);
+    if(opts.connectToDestination) gain.connect(ac.destination);
+    if(audioBuffer.numberOfChannels >= 2){
+      src.connect(splitter);
+      splitter.connect(analyserL,0);
+      splitter.connect(analyserR,1);
+    } else {
+      src.connect(analyserL);
+      src.connect(analyserR);
+    }
+    if(opts.connectToRecording && destForRecording){
+      gain.connect(destForRecording);
+    }
+    return { src, analyserL, analyserR, gain };
+  }
+
+  function startAnimation(){
+    if(animating) return;
+    animating = true;
+    drawLoop();
+  }
+
+  function stopAnimation(){
+    animating = false;
+    if(rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+
+  function drawLoop(){
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,W,H);
+    ctx.strokeStyle = 'rgba(120,120,120,0.16)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0,H/3); ctx.lineTo(W,H/3);
+    ctx.moveTo(0,H*2/3); ctx.lineTo(W,H*2/3);
+    ctx.stroke();
+    if(analyserL && analyserR){
+      const bufLen = analyserL.fftSize;
+      const dataL = new Float32Array(bufLen);
+      const dataR = new Float32Array(bufLen);
+      analyserL.getFloatTimeDomainData(dataL);
+      analyserR.getFloatTimeDomainData(dataR);
+      const sc = Number(scale.value);
+      ctx.lineWidth = Number(lineWidth.value);
+      ctx.strokeStyle = '#ffffff';
+      ctx.beginPath();
+      for(let i=0;i<bufLen;i++){
+        const x = (i/(bufLen-1))*W;
+        const y = H/3 + dataL[i]*sc;
+        if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+      ctx.beginPath();
+      for(let i=0;i<bufLen;i++){
+        const x = (i/(bufLen-1))*W;
+        const y = H*2/3 + dataR[i]*sc;
+        if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    }
+    if(animating) rafId = requestAnimationFrame(drawLoop);
+  }
+
+  function stopPlaying(){
+    try{
+      if(playingSource){
+        playingSource.onended = null;
+        try{ playingSource.stop(); }catch(e){}
+        try{ playingSource.disconnect(); }catch(e){}
+      }
+    }catch(e){ console.error(e); }
+    playingSource = null;
+  }
+
+  function stopRecordingSource(){
+    try{
+      if(recordingSource){
+        recordingSource.onended = null;
+        try{ recordingSource.stop(); }catch(e){}
+        try{ recordingSource.disconnect(); }catch(e){}
+      }
+    }catch(e){ console.error(e); }
+    recordingSource = null;
+  }
+
+  fileInput.addEventListener('change', async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if(!file) return;
+    setStatus(`読み込み: ${file.name}`);
+    try{
+      const ac = ensureAudioCtx();
+      const ab = await file.arrayBuffer();
+      audioBuffer = await ac.decodeAudioData(ab);
+      setStatus(`準備完了: ${file.name} （${audioBuffer.numberOfChannels}ch, ${Math.round(audioBuffer.sampleRate)}Hz）`);
+      playBtn.disabled = false;
+      recordBtn.disabled = false;
+      stopBtn.disabled = true;
+    }catch(err){
+      console.error(err);
+      setStatus('読み込みに失敗しました。コンソールを確認してください。');
+      playBtn.disabled = true;
+      recordBtn.disabled = true;
+      stopBtn.disabled = true;
+    }
+  });
+
+  playBtn.addEventListener('click', async () => {
+    if(!audioBuffer) return;
+    try{
+      const ac = ensureAudioCtx();
+      if(ac.state === 'suspended') await ac.resume();
+      stopPlaying();
+      const created = createSource({connectToDestination:true,connectToRecording:false});
+      playingSource = created.src;
+      playingSource.onended = () => {
+        setStatus('再生終了');
+        playBtn.disabled = false;
+        stopBtn.disabled = true;
+        stopRecordingSource();
+        stopAnimation();
+      };
+      playingSource.start(0);
+      setStatus('再生中');
+      playBtn.disabled = true;
+      stopBtn.disabled = false;
+      startAnimation();
+    }catch(err){
+      console.error(err);
+      setStatus('再生中にエラーが発生しました。コンソールを確認してください。');
+    }
+  });
+
+  recordBtn.addEventListener('click', async () => {
+    if(!audioBuffer) return;
+    try{
+      const ac = ensureAudioCtx();
+      if(ac.state === 'suspended') await ac.resume();
+      destForRecording = ac.createMediaStreamDestination();
+      const fps = Number(fpsSelect.value) || 60;
+      const canvasStream = canvas.captureStream(fps);
+      const created = createSource({connectToDestination:true,connectToRecording:true});
+      recordingSource = created.src;
+      const combined = new MediaStream([...canvasStream.getTracks(), ...destForRecording.stream.getTracks()]);
+      let mime = 'video/webm;codecs=vp9,opus';
+      if(!MediaRecorder.isTypeSupported(mime)){
+        mime = 'video/webm;codecs=vp8,opus';
+        if(!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
+      }
+      recordedChunks = [];
+      mediaRecorder = new MediaRecorder(combined, { mimeType: mime });
+      mediaRecorder.ondataavailable = (e) => { if(e.data && e.data.size) recordedChunks.push(e.data); };
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: recordedChunks[0]?.type || 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'visualizer.webm';
+        a.click();
+        URL.revokeObjectURL(url);
+        setStatus('録画完了: visualizer.webm を保存しました。');
+        stopAnimation();
+      };
+      recordingSource.onended = () => {
+        if(mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+        stopRecordingSource();
+        stopPlaying();
+        stopBtn.disabled = true;
+        playBtn.disabled = false;
+      };
+      mediaRecorder.start();
+      recordingSource.start(0);
+      setStatus('録画中');
+      stopBtn.disabled = false;
+      playBtn.disabled = true;
+      startAnimation();
+    }catch(err){
+      console.error(err);
+      setStatus('録画中にエラーが発生しました。コンソールを確認してください。');
+    }
+  });
+
+  stopBtn.addEventListener('click', () => {
+    try{
+      if(mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+      stopRecordingSource();
+      stopPlaying();
+      stopBtn.disabled = true;
+      playBtn.disabled = false;
+      setStatus('停止しました');
+      stopAnimation();
+    }catch(err){
+      console.error(err);
+      setStatus('停止中にエラーが発生しました。コンソールを確認してください。');
+    }
+  });
+
+  function adaptCanvasStyle(){
+    const cssW = Math.min(window.innerWidth * 0.92, 1200);
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = (cssW * canvas.height / canvas.width) + 'px';
+  }
+  window.addEventListener('resize', adaptCanvasStyle);
+  adaptCanvasStyle();
+
+  window.addEventListener('error', e => console.error('window error', e));
+  window.addEventListener('unhandledrejection', e => console.error('unhandled rejection', e));
+})();
+</script>
+</body>
+</html>
