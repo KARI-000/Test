@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>CRT Scan</title>
+<style>
+  html,body { height:100%; margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial; background:#0b0b0b; color:#ddd; }
+  #ui { position: absolute; left:12px; top:12px; z-index:10; background:rgba(0,0,0,0.55); padding:12px; border-radius:8px; max-width:380px; }
+  label{ display:block; font-size:13px; margin-top:8px; }
+  input[type="range"]{ width:100%; }
+  canvas{ display:block; width:100vw; height:100vh; }
+  .row{ display:flex; gap:8px; align-items:center; }
+  .small{ font-size:12px; color:#9aa; }
+  button,input[type="file"]{ margin-top:8px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div class="row">
+    <input type="file" id="file" accept="image/*">
+    <button id="sample">Load sample</button>
+  </div>
+  <label>blur <span class="small" id="lbl_blur">0.50</span>
+    <input id="horizontalBlur" type="range" min="0" max="1" step="0.01" value="0.5">
+  </label>
+  <label>RGB % <span class="small" id="lbl_rgb">20</span>
+    <input id="RGBeffect" type="range" min="0" max="100" step="1" value="20">
+  </label>
+  <label>Pixel size <span class="small" id="lbl_pixel">1.50</span>
+    <input id="pixelScale" type="range" min="1" max="50" step="0.1" value="1.5">
+  </label>
+  <label>Decay <span class="small" id="lbl_decay">9.00</span>
+    <input id="decayTime" type="range" min="0.01" max="10" step="0.01" value="9.0">
+  </label>
+  <label>Slowmotion <span class="small" id="lbl_slow">1.00</span>
+    <input id="slowmotion" type="range" min="0.1" max="1000" step="0.1" value="1.0">
+  </label>
+  <label class="row"><input id="useProgressive" type="checkbox"> <span class="small">Progressive scan (チェックでプログレッシブ)</span></label>
+  <div class="small" style="margin-top:8px">Tip: Pixel size を大きくするとドット・サブピクセルの効果が見やすい。</div>
+</div>
+
+<canvas id="glcanvas"></canvas>
+
+<script>
+(() => {
+  // ---------- GL helper ----------
+  function createShader(gl, type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error('Shader compile error:', gl.getShaderInfoLog(s));
+      console.log(src);
+      gl.deleteShader(s);
+      return null;
+    }
+    return s;
+  }
+  function createProgram(gl, vsSrc, fsSrc) {
+    const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
+    const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+    if(!vs || !fs) return null;
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      console.error('Program link error:', gl.getProgramInfoLog(p));
+      gl.deleteProgram(p);
+      return null;
+    }
+    return p;
+  }
+
+  // ---------- shaders ----------
+  const vertexSource = `
+  attribute vec2 a_position;
+  varying vec2 v_texCoord;
+  void main(){
+    v_texCoord = a_position * 0.5 + 0.5;
+    gl_Position = vec4(a_position, 0.0, 1.0);
+  }`;
+
+  const fragmentSource = `
+  precision highp float;
+  varying vec2 v_texCoord;
+  uniform vec2 u_resolution;
+  uniform float u_time;
+  uniform sampler2D u_image;
+  uniform float u_horizontalBlur;
+  uniform float u_RGBeffect;
+  uniform float u_pixelScale;
+  uniform float u_decayTime;
+  uniform float u_slowmotion;
+  uniform int u_useProgressive;
+
+  void main() {
+    vec3 output;
+    // 左上原点運用（gl_FragCoord の y を反転）
+    vec2 leftStart = vec2(gl_FragCoord.x, u_resolution.y - gl_FragCoord.y);
+    vec2 pixelCoord = floor(leftStart / u_pixelScale);
+    vec2 RGBdotSize = vec2(u_pixelScale / 6.0, u_pixelScale);
+    vec2 pixelPotision = (pixelCoord + 0.5) * u_pixelScale;
+    vec2 mosaic = vec2(pixelPotision.x / u_resolution.x, 1.0 - (pixelPotision.y / u_resolution.y));
+
+    if (u_horizontalBlur > 0.0) {
+      vec3 blurs = vec3(0.0);
+      float w0 = 0.3;
+      float w1 = 0.2;
+      float w2 = 0.1;
+      float w3 = 0.05;
+      float w4 = 0.01;
+      blurs += texture2D(u_image, mosaic).rgb * w0;
+      // 手で展開して安定化（動的配列インデックスを避ける）
+      {
+        float offset = 1.0 * (u_pixelScale / u_resolution.x) * u_horizontalBlur;
+        blurs += texture2D(u_image, mosaic + vec2(offset, 0.0)).rgb * w1;
+        blurs += texture2D(u_image, mosaic - vec2(offset, 0.0)).rgb * w1;
+      }
+      {
+        float offset = 2.0 * (u_pixelScale / u_resolution.x) * u_horizontalBlur;
+        blurs += texture2D(u_image, mosaic + vec2(offset, 0.0)).rgb * w2;
+        blurs += texture2D(u_image, mosaic - vec2(offset, 0.0)).rgb * w2;
+      }
+      {
+        float offset = 3.0 * (u_pixelScale / u_resolution.x) * u_horizontalBlur;
+        blurs += texture2D(u_image, mosaic + vec2(offset, 0.0)).rgb * w3;
+        blurs += texture2D(u_image, mosaic - vec2(offset, 0.0)).rgb * w3;
+      }
+      {
+        float offset = 4.0 * (u_pixelScale / u_resolution.x) * u_horizontalBlur;
+        blurs += texture2D(u_image, mosaic + vec2(offset, 0.0)).rgb * w4;
+        blurs += texture2D(u_image, mosaic - vec2(offset, 0.0)).rgb * w4;
+      }
+      output = blurs;
+    } else {
+      output = texture2D(u_image, mosaic).rgb;
+    }
+
+    if (u_RGBeffect > 0.0) {
+      float RGBpixels = mod(floor(leftStart.x / RGBdotSize.x), 6.0);
+      vec3 RGBMask = vec3(1.0);
+      float ratio = 1.0 - clamp(u_RGBeffect / 100.0, 0.0, 1.0);
+      if (mod(RGBpixels, 3.0) < 1.0) { RGBMask = vec3(1.0, ratio, ratio); }
+      else if (mod(RGBpixels, 3.0) < 2.0) { RGBMask = vec3(ratio, 1.0, ratio); }
+      else { RGBMask = vec3(ratio, ratio, 1.0); }
+      output *= RGBMask;
+    }
+
+    float localDecay = u_decayTime * 0.3;
+    if (localDecay > 0.0) {
+      float durationTime = 1.0 / 60.0;
+      float allLines = ceil(u_resolution.y / u_pixelScale);
+      float allPixels = floor(u_resolution.x / u_pixelScale);
+      float lineTime = durationTime / allLines;
+      float pixelTime = lineTime / max(allPixels, 1.0);
+      durationTime += lineTime;
+
+      float scanOrder;
+      if (u_useProgressive != 0) {
+        scanOrder = pixelCoord.y;
+      } else {
+        float lineNo = floor(pixelCoord.y / 2.0);
+        scanOrder = (mod(pixelCoord.y, 2.0) < 0.5) ? lineNo : ceil(allLines / 2.0) + lineNo;
+      }
+
+      float scanEnd = mod(u_time / u_slowmotion, durationTime) - scanOrder * lineTime;
+      if (scanEnd < 0.0) { scanEnd += durationTime; }
+      float pixelScanEnd = scanEnd - (pixelCoord.x * pixelTime);
+
+      float remapDecayTime = mix(lineTime, durationTime, clamp(localDecay, 0.0, 1.0));
+      float brightness = (pixelScanEnd < 0.0) ? 0.0 : pow(1.0 - smoothstep(0.0, remapDecayTime, pixelScanEnd), 4.0);
+      float longDecay = mix(10.0, 0.0, smoothstep(2.0, 3.0, localDecay));
+      output *= 1.0 - (1.0 - brightness) * longDecay * 0.1;
+
+      float flash = pixelTime * 5.0;
+      if (pixelScanEnd >= 0.0 && pixelScanEnd < flash) {
+        float flashAfter = pow(1.0 - (pixelScanEnd / flash), 2.0);
+        output = mix(output, vec3(1.0), flashAfter);
+      }
+    }
+
+    if (u_pixelScale > 1.0) {
+      float lineX = mod(leftStart.x, RGBdotSize.x);
+      float lineY = mod(leftStart.y, u_pixelScale / 8.0);
+      float lineXweight = u_pixelScale / 30.0;
+      float lineYweight = u_pixelScale / 200.0;
+      bool is_onX = lineX < lineXweight;
+      bool is_onY = lineY < lineYweight;
+      float RGBdotBit = mod(floor(leftStart.y / u_pixelScale * 8.0), 8.0);
+      if (RGBdotBit == 0.0 || RGBdotBit == 7.0) { output *= 0.4; }
+      else if (RGBdotBit == 1.0 || RGBdotBit == 6.0) { output *= 0.7; }
+      if (is_onX || is_onY) {
+        output = mix(output, vec3(0.0), smoothstep(1.0, 8.0, u_pixelScale));
+      }
+    }
+
+    gl_FragColor = vec4(output, 1.0);
+  }`;
+
+  // ---------- setup GL ----------
+  const canvas = document.getElementById('glcanvas');
+  const gl = canvas.getContext('webgl', { antialias: true, preserveDrawingBuffer: false });
+  if (!gl) {
+    alert('このブラウザは WebGL をサポートしていないのだ。別のブラウザで試してね。');
+    throw new Error('no webgl');
+  }
+
+  const program = createProgram(gl, vertexSource, fragmentSource);
+  if (!program) throw new Error('failed to create program');
+
+  const posLoc = gl.getAttribLocation(program, 'a_position');
+  const posBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1,-1,  1,-1,  -1,1,
+    -1,1,   1,-1,   1,1
+  ]), gl.STATIC_DRAW);
+
+  // uniforms
+  const uniforms = {
+    u_resolution: gl.getUniformLocation(program, 'u_resolution'),
+    u_time: gl.getUniformLocation(program, 'u_time'),
+    u_image: gl.getUniformLocation(program, 'u_image'),
+    u_horizontalBlur: gl.getUniformLocation(program, 'u_horizontalBlur'),
+    u_RGBeffect: gl.getUniformLocation(program, 'u_RGBeffect'),
+    u_pixelScale: gl.getUniformLocation(program, 'u_pixelScale'),
+    u_decayTime: gl.getUniformLocation(program, 'u_decayTime'),
+    u_slowmotion: gl.getUniformLocation(program, 'u_slowmotion'),
+    u_useProgressive: gl.getUniformLocation(program, 'u_useProgressive')
+  };
+
+  // texture
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  // initial tiny pixel to avoid uninitialized texture errors
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1,1,0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128,128,128,255]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  // ensure we DO NOT flip Y here; shader assumes unflipped upload
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+
+  // ---------- UI ----------
+  const UI = {
+    horizontalBlur: document.getElementById('horizontalBlur'),
+    RGBeffect: document.getElementById('RGBeffect'),
+    pixelScale: document.getElementById('pixelScale'),
+    decayTime: document.getElementById('decayTime'),
+    slowmotion: document.getElementById('slowmotion'),
+    useProgressive: document.getElementById('useProgressive'),
+    file: document.getElementById('file'),
+    sample: document.getElementById('sample'),
+    labels: {
+      blur: document.getElementById('lbl_blur'),
+      rgb: document.getElementById('lbl_rgb'),
+      pixel: document.getElementById('lbl_pixel'),
+      decay: document.getElementById('lbl_decay'),
+      slow: document.getElementById('lbl_slow')
+    }
+  };
+
+  function updateLabels(){
+    UI.labels.blur.textContent = parseFloat(UI.horizontalBlur.value).toFixed(2);
+    UI.labels.rgb.textContent = parseFloat(UI.RGBeffect.value);
+    UI.labels.pixel.textContent = parseFloat(UI.pixelScale.value).toFixed(2);
+    UI.labels.decay.textContent = parseFloat(UI.decayTime.value).toFixed(2);
+    UI.labels.slow.textContent = parseFloat(UI.slowmotion.value).toFixed(2);
+  }
+  updateLabels();
+  [UI.horizontalBlur, UI.RGBeffect, UI.pixelScale, UI.decayTime, UI.slowmotion].forEach(el => {
+    el.addEventListener('input', updateLabels);
+  });
+
+  UI.file.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const url = URL.createObjectURL(f);
+    loadImageToTexture(url).finally(() => {
+      try { URL.revokeObjectURL(url); } catch(e){/**/}
+    });
+  });
+
+  UI.sample.addEventListener('click', () => {
+    createSampleCheckerboardImage(512,512);
+  });
+
+  // ---------- texture helpers ----------
+  function isPowerOfTwo(v){ return (v & (v - 1)) === 0; }
+
+  function updateTextureFromImageElement(img){
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    // keep UNPACK_FLIP_Y false to match shader coordinate handling
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+
+    // upload
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+
+    // POT check
+    if (isPowerOfTwo(img.width) && isPowerOfTwo(img.height)) {
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    } else {
+      // NPOT: must use CLAMP_TO_EDGE and no mipmaps
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+  }
+
+  async function loadImageToTexture(url){
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        try {
+          updateTextureFromImageElement(img);
+          resolve();
+        } catch (e) { reject(e); }
+      };
+      img.onerror = (err) => { reject(err); };
+      img.src = url;
+    });
+  }
+
+  function createSampleCheckerboardImage(w,h){
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#222'; ctx.fillRect(0,0,w,h);
+    const sz = 32;
+    for(let y=0;y<h;y+=sz){
+      for(let x=0;x<w;x+=sz){
+        ctx.fillStyle = ((x+y)/sz)%2 ? '#444' : '#666';
+        ctx.fillRect(x,y,sz,sz);
+      }
+    }
+    const g = ctx.createLinearGradient(0,0,w,0);
+    g.addColorStop(0,'#f44'); g.addColorStop(0.5,'#4f4'); g.addColorStop(1,'#44f');
+    ctx.globalAlpha = 0.28;
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,w,h);
+
+    const img = new Image();
+    img.onload = () => {
+      updateTextureFromImageElement(img);
+    };
+    img.src = c.toDataURL('image/png'); // POT (512x512) -> safe to generate mipmaps
+  }
+
+  // initialize sample
+  createSampleCheckerboardImage(512,512);
+
+  // ---------- render ----------
+  let start = performance.now();
+
+  function resizeCanvasToDisplaySize() {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const width = Math.floor(window.innerWidth * dpr);
+    const height = Math.floor(window.innerHeight * dpr);
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+      canvas.style.width = window.innerWidth + 'px';
+      canvas.style.height = window.innerHeight + 'px';
+    }
+  }
+
+  function render(){
+    resizeCanvasToDisplaySize();
+    gl.viewport(0,0,canvas.width,canvas.height);
+    gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(program);
+
+    // attributes
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+    // uniforms
+    gl.uniform2f(uniforms.u_resolution, canvas.width, canvas.height);
+    const t = (performance.now() - start) * 0.001;
+    gl.uniform1f(uniforms.u_time, t);
+
+    // texture
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(uniforms.u_image, 0);
+
+    // UI -> uniforms
+    gl.uniform1f(uniforms.u_horizontalBlur, parseFloat(UI.horizontalBlur.value));
+    gl.uniform1f(uniforms.u_RGBeffect, parseFloat(UI.RGBeffect.value));
+    gl.uniform1f(uniforms.u_pixelScale, Math.max(1.0, parseFloat(UI.pixelScale.value)));
+    gl.uniform1f(uniforms.u_decayTime, parseFloat(UI.decayTime.value));
+    gl.uniform1f(uniforms.u_slowmotion, Math.max(0.0001, parseFloat(UI.slowmotion.value)));
+    gl.uniform1i(uniforms.u_useProgressive, UI.useProgressive.checked ? 1 : 0);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    requestAnimationFrame(render);
+  }
+  requestAnimationFrame(render);
+
+  // resize handling
+  window.addEventListener('resize', () => { /* canvas resizes next frame */ });
+
+})();
+</script>
+</body>
+</html>
