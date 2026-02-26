@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Spectrogram (WAV対応) → webm 保存</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; margin:20px; color:#111; }
+  h1 { font-size:1.1rem; margin-bottom:6px; }
+  .controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
+  label { font-size:0.9rem; }
+  input, select, button { font-size:0.9rem; }
+  canvas { border:1px solid #444; display:block; margin-top:10px; background:#000; }
+  .small { font-size:0.85rem; color:#444; }
+  button { padding:8px 12px; }
+  pre.small { background:#f7f7f7; padding:8px; overflow:auto; }
+</style>
+</head>
+<body>
+<h1>Spectrogram — WAV完全対応 → webm出力</h1>
+
+<div class="controls">
+  <label>音声ファイル (WAV推奨 / 他はブラウザデコーダ):
+    <input id="file" type="file" accept="audio/*">
+  </label>
+
+  <label>FFTサイズ:
+    <select id="fftSize"><option>1024</option><option>2048</option><option selected>4096</option><option>8192</option></select>
+  </label>
+
+  <label>Hop ratio (hop = N / hopRatio):
+    <input id="hopRatio" type="number" value="4" min="1" max="16" style="width:72px">
+  </label>
+
+  <label>FPS:
+    <input id="fps" type="number" value="30" min="1" max="60" style="width:72px">
+  </label>
+
+  <label>出力幅(px):
+    <input id="outWidth" type="number" value="1920" min="256" max="8192" style="width:90px">
+  </label>
+
+  <label>出力高さ(px):
+    <input id="outHeight" type="number" value="1080" min="64" max="4320" style="width:90px">
+  </label>
+
+  <label>min dB:
+    <input id="minDb" type="number" value="-100" style="width:80px">
+  </label>
+
+  <label>max dB:
+    <input id="maxDb" type="number" value="0" style="width:80px">
+  </label>
+
+  <button id="processBtn">スペクトログラム生成</button>
+  <button id="recordBtn" disabled>webm録画開始</button>
+  <a id="downloadLink" style="display:none"></a>
+</div>
+
+<p class="small">推奨ブラウザ: Chrome / Edge。SafariはMediaRecorderのサポートが限定される場合があります。</p>
+
+<canvas id="preview" width="960" height="540"></canvas>
+
+<hr>
+<h3 class="small">注意（.webm固定）</h3>
+<pre class="small">
+このページはブラウザ内で webm を生成します。.mov が必須なら、生成した webm をローカルで ffmpeg により変換してください。
+例: ffmpeg -i spectrogram.webm -c:v copy -c:a copy spectrogram.mov
+</pre>
+
+<script>
+/* =========================
+   基礎: FFT / STFT / utils
+   ========================= */
+
+/* bit reverse table */
+function bitReverseIndices(n) {
+  const rev = new Uint32Array(n);
+  const bits = Math.round(Math.log2(n));
+  for (let i = 0; i < n; i++) {
+    let x = i, y = 0;
+    for (let j = 0; j < bits; j++) {
+      y = (y << 1) | (x & 1);
+      x >>= 1;
+    }
+    rev[i] = y;
+  }
+  return rev;
+}
+
+/* in-place radix-2 FFT (iterative Cooley-Tukey) */
+function fftRadix2(real, imag) {
+  const n = real.length;
+  if ((n & (n - 1)) !== 0) throw new Error("FFT length must be power of two");
+  const rev = bitReverseIndices(n);
+  for (let i = 0; i < n; i++) {
+    if (i < rev[i]) {
+      let tr = real[i], ti = imag[i];
+      real[i] = real[rev[i]]; imag[i] = imag[rev[i]];
+      real[rev[i]] = tr; imag[rev[i]] = ti;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const half = len >> 1;
+    const theta = -2 * Math.PI / len;
+    const wPhaseStepRe = Math.cos(theta);
+    const wPhaseStepIm = Math.sin(theta);
+    for (let i = 0; i < n; i += len) {
+      let wr = 1, wi = 0;
+      for (let j = 0; j < half; j++) {
+        const l = i + j, r = l + half;
+        const tr = wr * real[r] - wi * imag[r];
+        const ti = wr * imag[r] + wi * real[r];
+        real[r] = real[l] - tr;
+        imag[r] = imag[l] - ti;
+        real[l] += tr;
+        imag[l] += ti;
+        const tmpWr = wr * wPhaseStepRe - wi * wPhaseStepIm;
+        wi = wr * wPhaseStepIm + wi * wPhaseStepRe;
+        wr = tmpWr;
+      }
+    }
+  }
+}
+
+/* Hann window */
+function hannWindow(N) {
+  const w = new Float32Array(N);
+  if (N === 1) { w[0] = 1; return w; }
+  for (let n = 0; n < N; n++) w[n] = 0.5 * (1 - Math.cos(2 * Math.PI * n / (N - 1)));
+  return w;
+}
+
+function nextPow2(v) { return 1 << Math.ceil(Math.log2(v)); }
+
+/* Aggregate groups of frames by averaging magnitudes (reduces time columns safely) */
+function aggregateSpectrogram(specDb, origCols, rows, maxCols) {
+  if (origCols <= maxCols) return {data: specDb, cols: origCols, rows};
+  const group = Math.ceil(origCols / maxCols);
+  const newCols = Math.ceil(origCols / group);
+  const out = new Float32Array(newCols * rows);
+  for (let c = 0; c < newCols; c++) {
+    const start = c * group;
+    const end = Math.min(origCols, (c+1)*group);
+    const cnt = end - start;
+    for (let r = 0; r < rows; r++) {
+      let s = 0;
+      for (let k = start; k < end; k++) s += specDb[k * rows + r];
+      out[c * rows + r] = s / cnt;
+    }
+  }
+  return {data: out, cols: newCols, rows};
+}
+
+/* compute STFT and return dB spectrogram (time-major) */
+function computeSTFT(signal, sampleRate, N, hop, minDb, maxDb, maxTimeCols = 200000) {
+  const L = signal.length;
+  const nFrames = Math.max(1, Math.floor((L - N) / hop) + 1);
+  const framesToCompute = nFrames; // compute all frames first, decimate later if needed
+  const half = N / 2;
+  const specDb = new Float32Array(framesToCompute * half);
+  const win = hannWindow(N);
+  const re = new Float32Array(N);
+  const im = new Float32Array(N);
+  const eps = 1e-12;
+
+  for (let m = 0; m < framesToCompute; m++) {
+    const offset = m * hop;
+    for (let n = 0; n < N; n++) {
+      const idx = offset + n;
+      const xn = (idx < L) ? signal[idx] : 0;
+      re[n] = xn * win[n];
+      im[n] = 0;
+    }
+    fftRadix2(re, im);
+    for (let k = 0; k < half; k++) {
+      const mag = Math.hypot(re[k], im[k]);
+      specDb[m * half + k] = 20 * Math.log10(mag + eps);
+    }
+  }
+
+  // compute data min/max if not given
+  let dataMin = Infinity, dataMax = -Infinity;
+  for (let i = 0; i < specDb.length; i++) {
+    const v = specDb[i];
+    if (v < dataMin) dataMin = v;
+    if (v > dataMax) dataMax = v;
+  }
+
+  if (!isFinite(minDb)) minDb = Math.floor(dataMin);
+  if (!isFinite(maxDb)) maxDb = Math.ceil(dataMax);
+  if (maxDb <= minDb) maxDb = minDb + 1;
+
+  // decimate by grouping if too many columns
+  const MAX_COLS = maxTimeCols;
+  const aggregated = aggregateSpectrogram(specDb, framesToCompute, half, MAX_COLS);
+  const cols = aggregated.cols;
+  const rows = aggregated.rows;
+  const data = aggregated.data;
+
+  // map to RGBA image (flip freq so high freq at top)
+  const range = maxDb - minDb;
+  const img = new Uint8ClampedArray(cols * rows * 4);
+  for (let c = 0; c < cols; c++) {
+    for (let r = 0; r < rows; r++) {
+      const db = data[c * rows + r];
+      let v = Math.round(255 * (db - minDb) / range);
+      if (v < 0) v = 0;
+      if (v > 255) v = 255;
+      const row = rows - 1 - r;
+      const idx = (row * cols + c) * 4;
+      img[idx] = v; img[idx+1] = v; img[idx+2] = v; img[idx+3] = 255;
+    }
+  }
+
+  return { width: cols, height: rows, imageData: img, sampleRate, hop, N, nFrames, minDb, maxDb };
+}
+
+/* =========================
+   WAVパーサ（堅牢版）
+   - RIFF/WAVE 基本対応
+   - fmt (including WAVE_FORMAT_EXTENSIBLE) の読む
+   - data チャンク検索
+   - 16/24/32-bit PCM, 32-bit float 対応
+   - ファイルが大きすぎる場合は早期にエラーを返す
+   ========================= */
+
+async function decodeWavToMonoArray(file) {
+  const buffer = await file.arrayBuffer();
+  const view = new DataView(buffer);
+  function readStr(off, len) {
+    let s = "";
+    for (let i = 0; i < len; i++) s += String.fromCharCode(view.getUint8(off + i));
+    return s;
+  }
+
+  if (view.byteLength < 12) throw new Error("ファイルが短すぎてWAVではない可能性があります");
+  const riff = readStr(0, 4);
+  const wave = readStr(8, 4);
+  if (riff !== 'RIFF' || wave !== 'WAVE') {
+    throw new Error("RIFF/WAVE ヘッダが見つかりません");
+  }
+
+  let offset = 12;
+  let audioFormat = 0, numChannels = 0, sampleRate = 0, bitsPerSample = 0;
+  let dataOffset = 0, dataSize = 0;
+
+  while (offset + 8 <= view.byteLength) {
+    const chunkId = readStr(offset, 4);
+    const chunkSize = view.getUint32(offset + 4, true);
+    const chunkData = offset + 8;
+
+    if (chunkId === 'fmt ') {
+      // parse fmt chunk (size >= 16)
+      if (chunkSize < 16) throw new Error("fmt チャンクが短すぎます");
+      audioFormat = view.getUint16(chunkData, true);
+      numChannels = view.getUint16(chunkData + 2, true);
+      sampleRate = view.getUint32(chunkData + 4, true);
+      bitsPerSample = view.getUint16(chunkData + 14, true);
+      // WAVE_FORMAT_EXTENSIBLE (0xFFFE) handling
+      if (audioFormat === 0xFFFE && chunkSize >= 40) {
+        // subFormat GUID begins at chunkData + 24
+        const subFormat = view.getUint16(chunkData + 24, true);
+        if (subFormat === 1) audioFormat = 1; // PCM
+        else if (subFormat === 3) audioFormat = 3; // float
+        // otherwise leave as-is and error later
+      }
+    } else if (chunkId === 'data') {
+      dataOffset = chunkData;
+      dataSize = chunkSize;
+      break;
+    }
+
+    // advance (chunks are word-aligned)
+    offset = chunkData + chunkSize + (chunkSize & 1);
+  }
+
+  if (!dataOffset) throw new Error("data チャンクが見つかりません");
+
+  const bytesPerSample = bitsPerSample / 8;
+  const totalFrames = Math.floor(dataSize / (bytesPerSample * numChannels));
+  if (!isFinite(totalFrames) || totalFrames <= 0) throw new Error("無効なWAVデータサイズ");
+
+  // safety cap: protect browser memory (adjust as needed)
+  const MAX_FRAMES = 200 * 1000 * 1000; // 200M frames
+  if (totalFrames > MAX_FRAMES) throw new Error("ファイルが非常に大きいです（メモリ制限）。ストリーミング処理を検討してください。");
+
+  const mono = new Float32Array(totalFrames);
+  let ptr = dataOffset;
+
+  for (let i = 0; i < totalFrames; i++) {
+    let sum = 0;
+    for (let ch = 0; ch < numChannels; ch++) {
+      let sample = 0;
+      if (audioFormat === 1) { // PCM integer
+        if (bitsPerSample === 16) {
+          sample = view.getInt16(ptr, true) / 32768;
+        } else if (bitsPerSample === 24) {
+          // read 3 bytes little-endian and sign-extend
+          const b0 = view.getUint8(ptr);
+          const b1 = view.getUint8(ptr + 1);
+          const b2 = view.getUint8(ptr + 2);
+          let int = (b2 << 16) | (b1 << 8) | b0;
+          if (int & 0x800000) int |= 0xFF000000; // sign extend
+          sample = int / 8388608; // 2^23
+        } else if (bitsPerSample === 32) {
+          sample = view.getInt32(ptr, true) / 2147483648;
+        } else {
+          throw new Error("未対応のPCMビット深度: " + bitsPerSample);
+        }
+      } else if (audioFormat === 3) { // IEEE float
+        if (bitsPerSample === 32) {
+          sample = view.getFloat32(ptr, true);
+        } else {
+          throw new Error("未対応のFloatビット深度: " + bitsPerSample);
+        }
+      } else {
+        throw new Error("未対応WAVフォーマット(audioFormat=" + audioFormat + ").");
+      }
+      sum += sample;
+      ptr += bytesPerSample;
+    }
+    mono[i] = sum / numChannels;
+  }
+
+  return { data: mono, sampleRate, duration: totalFrames / sampleRate };
+}
+
+/* decode with browser decodeAudioData as fallback for non-wav / when manual parse fails */
+let audioCtx = null;
+async function decodeToMonoArrayFile(file) {
+  try {
+    const name = (file.name || '').toLowerCase();
+    if (name.endsWith('.wav') || file.type === 'audio/wav' || file.type === 'audio/x-wav') {
+      return await decodeWavToMonoArray(file);
+    }
+  } catch (e) {
+    console.warn('manual WAV parse failed, falling back to decodeAudioData:', e);
+  }
+
+  // fallback: AudioContext.decodeAudioData
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const arrayBuffer = await file.arrayBuffer();
+  const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+  const ch = decoded.numberOfChannels;
+  const len = decoded.length;
+  const out = new Float32Array(len);
+  if (ch === 1) {
+    out.set(decoded.getChannelData(0));
+  } else {
+    for (let c = 0; c < ch; c++) {
+      const d = decoded.getChannelData(c);
+      for (let i = 0; i < len; i++) out[i] = (c === 0 ? d[i] : out[i] + d[i]);
+    }
+    for (let i = 0; i < len; i++) out[i] /= ch;
+  }
+  return { data: out, sampleRate: decoded.sampleRate, duration: decoded.duration };
+}
+
+/* =========================
+   UI / 描画 / 録画
+   ========================= */
+
+const fileInput = document.getElementById('file');
+const fftSizeEl = document.getElementById('fftSize');
+const hopRatioEl = document.getElementById('hopRatio');
+const processBtn = document.getElementById('processBtn');
+const recordBtn = document.getElementById('recordBtn');
+const preview = document.getElementById('preview');
+const downloadLink = document.getElementById('downloadLink');
+const fpsEl = document.getElementById('fps');
+const outWidthEl = document.getElementById('outWidth');
+const outHeightEl = document.getElementById('outHeight');
+const minDbEl = document.getElementById('minDb');
+const maxDbEl = document.getElementById('maxDb');
+
+let stftResult = null;
+let recordedBlob = null;
+
+async function drawFullSpectrogramToCanvas(st, targetW, targetH) {
+  const cols = st.width, rows = st.height;
+  const off = document.createElement('canvas');
+  off.width = cols; off.height = rows;
+  const offCtx = off.getContext('2d');
+  const img = new ImageData(st.imageData, cols, rows);
+  offCtx.putImageData(img, 0, 0);
+
+  // scale to targetW x targetH
+  const full = document.createElement('canvas');
+  full.width = targetW; full.height = targetH;
+  const ctx = full.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  try { ctx.imageSmoothingQuality = 'high'; } catch(e){}
+  ctx.drawImage(off, 0, 0, targetW, targetH);
+
+  // prepare preview canvas with devicePixelRatio
+  const dpr = window.devicePixelRatio || 1;
+  preview.width = targetW * dpr;
+  preview.height = targetH * dpr;
+  preview.style.width = targetW + 'px';
+  preview.style.height = targetH + 'px';
+  const pctx = preview.getContext('2d');
+  pctx.setTransform(dpr,0,0,dpr,0,0);
+  pctx.clearRect(0,0,targetW,targetH);
+  pctx.drawImage(full, 0, 0);
+
+  st.fullCanvas = full;
+  st.fullWidth = targetW;
+  st.fullHeight = targetH;
+  st.dpr = dpr;
+}
+
+processBtn.addEventListener('click', async () => {
+  const f = fileInput.files[0];
+  if (!f) { alert('音声ファイルを選択してください'); return; }
+  processBtn.disabled = true;
+  processBtn.textContent = '処理中…';
+  try {
+    const decoded = await decodeToMonoArrayFile(f);
+    if (!decoded || !decoded.data || decoded.data.length === 0) throw new Error("音声データが読み取れません");
+    let N_req = parseInt(fftSizeEl.value, 10);
+    if (!N_req || N_req <= 0) N_req = 4096;
+    const N = ((N_req & (N_req - 1)) === 0) ? N_req : nextPow2(N_req);
+    const hopRatio = Math.max(1, parseInt(hopRatioEl.value, 10) || 4);
+    const hop = Math.floor(N / hopRatio);
+    const minDb = parseFloat(minDbEl.value);
+    const maxDb = parseFloat(maxDbEl.value);
+
+    // compute STFT (with internal aggregation safeguard)
+    const MAX_TIME_COLS = 200000; // safety
+    const st = computeSTFT(decoded.data, decoded.sampleRate, N, hop, minDb, maxDb, MAX_TIME_COLS);
+    st.duration = decoded.duration;
+    st.audioArray = decoded.data;
+    st.sampleRate = decoded.sampleRate;
+    // draw to canvas scaled
+    const targetW = Math.max(256, Math.min(8192, parseInt(outWidthEl.value,10) || 1920));
+    const targetH = Math.max(64, Math.min(4320, parseInt(outHeightEl.value,10) || 1080));
+    await drawFullSpectrogramToCanvas(st, targetW, targetH);
+    stftResult = st;
+    recordBtn.disabled = false;
+    downloadLink.style.display = 'none';
+  } catch (e) {
+    console.error(e);
+    alert('エラー: ' + (e && e.message ? e.message : e));
+  } finally {
+    processBtn.disabled = false;
+    processBtn.textContent = 'スペクトログラム生成';
+  }
+});
+
+recordBtn.addEventListener('click', async () => {
+  if (!stftResult) return alert('先にスペクトログラムを生成してください');
+  recordBtn.disabled = true;
+  recordBtn.textContent = '録画準備…';
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const buffer = audioCtx.createBuffer(1, stftResult.audioArray.length, stftResult.sampleRate);
+    buffer.copyToChannel(stftResult.audioArray, 0, 0);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+
+    const fps = Math.max(1, parseInt(fpsEl.value,10) || 30);
+    const stream = preview.captureStream(fps);
+
+    // force webm (vp8/vp9) where possible
+    let mime = '';
+    if (MediaRecorder.isTypeSupported) {
+      if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) mime = 'video/webm;codecs=vp9';
+      else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) mime = 'video/webm;codecs=vp8';
+    }
+    if (!mime) mime = 'video/webm';
+    const options = { mimeType: mime };
+    const recorder = new MediaRecorder(stream, options);
+    const chunks = [];
+    recorder.ondataavailable = ev => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    recorder.onstop = () => {
+      recordedBlob = new Blob(chunks, { type: mime });
+      const url = URL.createObjectURL(recordedBlob);
+      downloadLink.href = url;
+      downloadLink.download = 'spectrogram.webm';
+      downloadLink.style.display = 'inline';
+      downloadLink.textContent = '録画完了 — ダウンロード webm';
+      recordBtn.disabled = false;
+      recordBtn.textContent = 'webm録画開始';
+      try { src.disconnect(); } catch(e){}
+    };
+
+    // schedule: start recorder slightly before audio start, animate viewport synced to audioCtx.currentTime
+    const startDelay = 0.1;
+    const startTime = audioCtx.currentTime + startDelay;
+
+    recorder.start();
+    src.connect(audioCtx.destination);
+    src.start(startTime);
+
+    // animate viewport
+    const full = stftResult.fullCanvas;
+    const viewW = stftResult.fullWidth;
+    const viewH = stftResult.fullHeight;
+    const ctx = preview.getContext('2d');
+    ctx.setTransform(stftResult.dpr || (window.devicePixelRatio||1),0,0,stftResult.dpr || (window.devicePixelRatio||1),0,0);
+
+    const duration = stftResult.duration || (stftResult.audioArray.length / stftResult.sampleRate);
+    const t0 = startTime;
+    let raf = 0;
+    function animate() {
+      const now = audioCtx.currentTime;
+      const t = now - t0;
+      const prog = Math.max(0, Math.min(1, t / duration));
+      const x = Math.floor(prog * Math.max(0, full.width - viewW));
+      ctx.clearRect(0,0,viewW,viewH);
+      ctx.drawImage(full, x, 0, viewW, viewH, 0, 0, viewW, viewH);
+      if (t < duration + 0.5) raf = requestAnimationFrame(animate);
+      else {
+        setTimeout(()=> {
+          try { recorder.stop(); } catch(e) {}
+          if (raf) cancelAnimationFrame(raf);
+        }, 150);
+      }
+    }
+
+    // start animation slightly after startTime relative to currentTime
+    setTimeout(() => { animate(); }, Math.max(0, (startTime - audioCtx.currentTime) * 1000));
+
+    recordBtn.textContent = '録画中…';
+  } catch (e) {
+    console.error(e);
+    alert('録画エラー: ' + (e && e.message ? e.message : e));
+    recordBtn.disabled = false;
+    recordBtn.textContent = 'webm録画開始';
+  }
+});
+</script>
+</body>
+</html>
