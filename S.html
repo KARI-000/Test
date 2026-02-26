@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>MiniMeters Style - Pro Definitive</title>
+    <style>
+        :root { --bg: #030303; --accent: #ff4d00; --panel: rgba(10, 10, 10, 0.98); }
+        body { background-color: var(--bg); color: #fff; font-family: 'Consolas', monospace; margin: 0; overflow: hidden; display: flex; height: 100vh; }
+        
+        #ui-layer {
+            position: absolute; top: 20px; left: 20px; z-index: 100;
+            background: var(--panel); padding: 25px; border-radius: 2px;
+            border: 1px solid #222; border-top: 4px solid var(--accent);
+            width: 320px; box-shadow: 0 30px 60px rgba(0,0,0,0.9);
+        }
+        .title { font-size: 14px; font-weight: bold; color: #fff; margin-bottom: 20px; letter-spacing: 2px; }
+        .group { margin-bottom: 15px; }
+        .label { font-size: 10px; color: #555; margin-bottom: 5px; text-transform: uppercase; }
+        
+        select, input[type="range"], input[type="file"] {
+            width: 100%; background: #000; border: 1px solid #333; color: #eee;
+            padding: 8px; font-size: 11px; margin-top: 5px; outline: none;
+        }
+
+        .btn-main {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;
+        }
+        button {
+            padding: 12px; background: #1a1a1a; border: 1px solid #333; color: #fff;
+            font-size: 11px; cursor: pointer; transition: 0.1s;
+        }
+        button:hover:not(:disabled) { background: #222; border-color: var(--accent); }
+        button#recBtn { background: #300; border-color: #600; color: #ff8888; }
+        button#recBtn:hover { background: #500; }
+        button:disabled { opacity: 0.1; cursor: not-allowed; }
+
+        #status {
+            margin-top: 20px; font-size: 10px; padding: 10px;
+            background: #000; border: 1px solid #222; color: #00ffaa;
+            min-height: 1.2em; line-height: 1.4; word-break: break-all;
+        }
+
+        #canvas-container { flex-grow: 1; background: #000; position: relative; }
+        canvas { width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; }
+    </style>
+</head>
+<body>
+
+<div id="ui-layer">
+    <div class="title">SPECTRA-VIBE ENGINE</div>
+    
+    <div class="group">
+        <div class="label">Audio File (.wav, .mp3, .flac)</div>
+        <input type="file" id="audioInput">
+    </div>
+
+    <div class="group">
+        <div class="label">Color Palette</div>
+        <select id="colorPreset">
+            <option value="magma">MAGMA (Professional)</option>
+            <option value="neon">NEON NIGHT (Cyberpunk)</option>
+            <option value="acid">ACID GREEN (High Contrast)</option>
+            <option value="ice">ICE BREATHE (Blue)</option>
+        </select>
+    </div>
+
+    <div class="group">
+        <div class="label">Visual Scroll Speed</div>
+        <input type="range" id="scrollRange" min="1" max="20" value="5">
+    </div>
+
+    <div class="btn-main">
+        <button id="playBtn" disabled>PREVIEW</button>
+        <button id="recBtn" disabled>RECORD</button>
+    </div>
+    <button id="stopBtn" style="width:100%; margin-top:10px;" disabled>STOP / RESET</button>
+    
+    <div id="status">READY: WAITING FOR FILE...</div>
+</div>
+
+<div id="canvas-container">
+    <canvas id="mainCanvas" width="1920" height="1080"></canvas>
+</div>
+
+<script>
+    // --- Configuration ---
+    const FFT_SIZE = 16384; 
+    const canvas = document.getElementById('mainCanvas');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const status = document.getElementById('status');
+    const audioInput = document.getElementById('audioInput');
+
+    let audioCtx, analyser, source, animationId, mediaRecorder;
+    let audioDataBuffer = null; // デコード前のデータを保持
+
+    // --- Color Engines ---
+    const palettes = {
+        magma: (v) => {
+            const r = Math.pow(v, 0.8) * 255;
+            const g = Math.pow(v, 2.5) * 200;
+            const b = Math.pow(v, 5.0) * 255;
+            const glow = v > 0.9 ? (v - 0.9) * 10 * 255 : 0;
+            return `rgb(${Math.min(255, r+glow)},${Math.min(255, g+glow)},${Math.min(255, b+glow)})`;
+        },
+        neon: (v) => {
+            return `rgb(${v*255}, ${Math.pow(v,2)*50}, ${255 - Math.pow(v,0.3)*100})`;
+        },
+        acid: (v) => `rgb(${Math.pow(v,5)*255}, ${v*255}, ${Math.pow(v,2)*50})`,
+        ice: (v) => `rgb(${Math.pow(v,4)*100}, ${Math.pow(v,1.5)*200}, ${v*255})`
+    };
+
+    // --- File Loader (修正版) ---
+    audioInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        updateStatus(`LOADING: ${file.name}...`);
+        
+        try {
+            // FileReaderではなく最新のarrayBuffer()を使用
+            audioDataBuffer = await file.arrayBuffer();
+            updateStatus("LOADED SUCCESSFUL // READY TO DECODE");
+            document.getElementById('playBtn').disabled = false;
+            document.getElementById('recBtn').disabled = false;
+        } catch (err) {
+            updateStatus("FILE ERROR: " + err.message, "#ff4444");
+        }
+    });
+
+    // --- Core Processing ---
+    async function initAudio(isRecording) {
+        if (audioCtx) await audioCtx.close();
+        
+        // ブラウザの制限を回避するためクリックイベント内で生成
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+        
+        updateStatus("DECODING AUDIO DATA...");
+        try {
+            // バッファをコピーして使用（再読み込み可能にするため）
+            const decodedData = await audioCtx.decodeAudioData(audioDataBuffer.slice(0));
+            
+            source = audioCtx.createBufferSource();
+            source.buffer = decodedData;
+
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = FFT_SIZE;
+            analyser.smoothingTimeConstant = 0.15; // 反応の良さ
+
+            source.connect(analyser);
+            analyser.connect(audioCtx.destination);
+
+            if (isRecording) {
+                const streamDest = audioCtx.createMediaStreamDestination();
+                source.connect(streamDest);
+                startRecording(streamDest.stream);
+            }
+
+            source.onended = () => {
+                if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+                updateStatus("PLAYBACK FINISHED");
+                stopEverything();
+            };
+
+            source.start(0);
+            updateStatus("ENGINE RUNNING...");
+            draw();
+            document.getElementById('stopBtn').disabled = false;
+        } catch (err) {
+            updateStatus("DECODE ERROR: " + err.message, "#ff4444");
+        }
+    }
+
+    function startRecording(audioStream) {
+        const canvasStream = canvas.captureStream(60);
+        const combined = new MediaStream([
+            canvasStream.getVideoTracks()[0],
+            audioStream.getAudioTracks()[0]
+        ]);
+
+        const options = { mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 25000000 };
+        mediaRecorder = new MediaRecorder(combined, options);
+        let chunks = [];
+        
+        mediaRecorder.ondataavailable = e => chunks.push(e.data);
+        mediaRecorder.onstop = () => {
+            const blob = new Blob(chunks, { type: 'video/webm' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `SpectraVibe_${Date.now()}.webm`;
+            a.click();
+            updateStatus("VIDEO EXPORTED");
+        };
+        mediaRecorder.start();
+        updateStatus("RECORDING IN PROGRESS...");
+    }
+
+    function stopEverything() {
+        if (source) try { source.stop(); } catch(e){}
+        if (animationId) cancelAnimationFrame(animationId);
+        if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+        document.getElementById('stopBtn').disabled = true;
+    }
+
+    // --- Drawing Engine ---
+    function draw() {
+        animationId = requestAnimationFrame(draw);
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(dataArray);
+
+        const w = canvas.width;
+        const h = canvas.height;
+        const speed = parseInt(document.getElementById('scrollRange').value);
+        const preset = document.getElementById('colorPreset').value;
+
+        // Shift existing image
+        ctx.drawImage(canvas, speed, 0, w - speed, h, 0, 0, w - speed, h);
+        
+        // Clear new strip
+        ctx.fillStyle = "#000";
+        ctx.fillRect(w - speed, 0, speed, h);
+
+        // Logarithmic Scale Mapping (MiniMeters Style)
+        const minFreq = 20;
+        const maxFreq = 20000;
+        const logMin = Math.log10(minFreq);
+        const logMax = Math.log10(maxFreq);
+        const resolution = 700; // Vertical Density
+        const barH = h / resolution;
+
+        for (let i = 0; i < resolution; i++) {
+            const percent = i / resolution;
+            const freq = Math.pow(10, logMin + percent * (logMax - logMin));
+            const bin = Math.floor(freq / (audioCtx.sampleRate / FFT_SIZE));
+            
+            if (bin < dataArray.length) {
+                const val = dataArray[bin];
+                if (val < 5) continue;
+
+                ctx.fillStyle = palettes[preset](val / 255);
+                const yPos = h - (percent * h);
+                ctx.fillRect(w - speed, yPos, speed, barH + 1);
+            }
+        }
+    }
+
+    function updateStatus(msg, color = "#00ffaa") {
+        status.innerText = msg.toUpperCase();
+        status.style.color = color;
+    }
+
+    document.getElementById('playBtn').onclick = () => initAudio(false);
+    document.getElementById('recBtn').onclick = () => initAudio(true);
+    document.getElementById('stopBtn').onclick = stopEverything;
+</script>
+</body>
+</html>
