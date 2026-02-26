@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>MiniMeters Pro - Full Alignment Edition</title>
+    <style>
+        :root { --bg: #000; --accent: #00f2ff; --panel: #0a0a0a; --border: #1a1a1a; }
+        body { background: var(--bg); color: #fff; font-family: 'Segoe UI', sans-serif; margin: 0; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+        
+        #toolbar {
+            background: var(--panel); padding: 10px 20px; display: flex; gap: 20px; 
+            align-items: center; border-bottom: 2px solid var(--border);
+        }
+        .tool-group { display: flex; flex-direction: column; gap: 4px; }
+        .tool-group label { font-size: 10px; color: #444; font-weight: 900; text-transform: uppercase; letter-spacing: 1px; }
+        
+        input[type="file"], select, button, input[type="range"] {
+            background: #111; border: 1px solid #333; color: #eee; padding: 5px 10px; font-size: 11px; outline: none;
+        }
+        button { cursor: pointer; font-weight: bold; min-width: 80px; border-radius: 1px; transition: 0.2s; }
+        button:hover:not(:disabled) { border-color: var(--accent); background: #1a1a1a; }
+        button.active { background: var(--accent); color: #000; border-color: var(--accent); }
+        button#recBtn.recording { background: #ff0044; color: #fff; border-color: #ff0044; animation: pulse 1s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+        button:disabled { opacity: 0.1; }
+
+        #canvas-container { flex-grow: 1; background: #000; width: 100vw; overflow: hidden; }
+        #masterCanvas { width: 100%; height: 100%; display: block; }
+        
+        #status { font-size: 11px; color: var(--accent); padding: 6px 15px; background: #050505; border: 1px solid #1a1a1a; min-width: 300px; font-family: monospace; }
+    </style>
+</head>
+<body>
+
+<div id="toolbar">
+    <div class="tool-group">
+        <label>1. Audio File</label>
+        <input type="file" id="audioInput" accept=".wav,.mp3,.flac,.m4a">
+    </div>
+    <div class="tool-group">
+        <label>2. Scroll Speed</label>
+        <input type="range" id="speedRange" min="1" max="40" value="12">
+    </div>
+    <div class="tool-group">
+        <label>3. Color Preset</label>
+        <select id="colorSelect">
+            <option value="magma">MAGMA (Standard)</option>
+            <option value="cyber">CYBER (Neon)</option>
+            <option value="acid">ACID (Toxic)</option>
+            <option value="ice">FROZEN (Polar)</option>
+        </select>
+    </div>
+    <div class="tool-group">
+        <label>4. Master Controls</label>
+        <div style="display:flex; gap:5px;">
+            <button id="playBtn" disabled>PLAY</button>
+            <button id="recBtn" disabled>RECORD</button>
+            <button id="stopBtn" disabled>STOP</button>
+        </div>
+    </div>
+    <div id="status">STATUS: STANDBY</div>
+</div>
+
+<div id="canvas-container">
+    <canvas id="masterCanvas"></canvas>
+</div>
+
+<script>
+    const FFT_SIZE = 16384;
+    let audioCtx, source, analyserMono, analyserL, analyserR, animationId, mediaRecorder;
+    let audioBuffer = null;
+    let recordedChunks = [];
+    
+    const canvas = document.getElementById('masterCanvas');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const statusEl = document.getElementById('status');
+
+    const palettes = {
+        magma: (v) => [v * 255, Math.pow(v, 3) * 180, Math.pow(v, 8) * 255],
+        cyber: (v) => [v * 255, Math.pow(v, 2) * 120, 255 - v * 150],
+        acid: (v) => [Math.pow(v, 7) * 200, v * 255, 0],
+        ice: (v) => [Math.pow(v, 4) * 150, Math.pow(v, 1.4) * 200, v * 255]
+    };
+
+    function getRGB(v, preset) {
+        const [r, g, b] = palettes[preset](Math.max(0, Math.min(1, v)));
+        return `rgb(${r},${g},${b})`;
+    }
+
+    // WAV読み込みの確実な処理
+    document.getElementById('audioInput').onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        statusEl.innerText = "STATUS: READING BINARY...";
+        
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+            const tempCtx = new AudioContext();
+            statusEl.innerText = "STATUS: DECODING PCM DATA...";
+            audioBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+            tempCtx.close();
+            statusEl.innerText = `READY: ${file.name.toUpperCase()}`;
+            document.getElementById('playBtn').disabled = document.getElementById('recBtn').disabled = false;
+            resize();
+        } catch (err) {
+            statusEl.innerText = "STATUS: ERROR - FILE DECODE FAILED";
+        }
+    };
+
+    function resize() {
+        canvas.width = canvas.clientWidth * window.devicePixelRatio;
+        canvas.height = canvas.clientHeight * window.devicePixelRatio;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    async function start(isRecording) {
+        if (audioCtx) await audioCtx.close();
+        audioCtx = new AudioContext({ sampleRate: 48000 });
+        source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+
+        analyserMono = audioCtx.createAnalyser();
+        analyserMono.fftSize = FFT_SIZE;
+        const splitter = audioCtx.createChannelSplitter(2);
+        analyserL = audioCtx.createAnalyser(); 
+        analyserR = audioCtx.createAnalyser();
+        analyserL.fftSize = analyserR.fftSize = 2048;
+
+        source.connect(analyserMono);
+        source.connect(splitter);
+        splitter.connect(analyserL, 0); splitter.connect(analyserR, 1);
+        
+        const streamDest = audioCtx.createMediaStreamDestination();
+        source.connect(streamDest);
+        source.connect(audioCtx.destination);
+
+        if (isRecording) {
+            recordedChunks = [];
+            const stream = canvas.captureStream(60);
+            stream.addTrack(streamDest.stream.getAudioTracks()[0]);
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 60000000 });
+            mediaRecorder.ondataavailable = e => recordedChunks.push(e.data);
+            mediaRecorder.onstop = () => {
+                const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `Full_Alignment_Render.webm`;
+                a.click();
+            };
+            mediaRecorder.start();
+            document.getElementById('recBtn').classList.add('recording');
+        }
+
+        source.start(0);
+        document.getElementById('stopBtn').disabled = false;
+        source.onended = stop;
+        render();
+    }
+
+    function stop() {
+        if (source) try { source.stop(); } catch(e){}
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+        document.getElementById('recBtn').classList.remove('recording');
+        cancelAnimationFrame(animationId);
+    }
+
+    function render() {
+        animationId = requestAnimationFrame(render);
+        const preset = document.getElementById('colorSelect').value;
+        const speed = parseInt(document.getElementById('speedRange').value);
+        const W = canvas.width;
+        const H = canvas.height;
+
+        // セクション比率: SPEC 50% | WAVE 25% | STEREO 25%
+        const specW = W * 0.5;
+        const waveW = W * 0.25;
+        const stereoW = W * 0.25;
+
+        // --- 1. SPECTROGRAM (高さ H いっぱい) ---
+        const dataSpec = new Uint8Array(analyserMono.frequencyBinCount);
+        analyserMono.getByteFrequencyData(dataSpec);
+        
+        // 既存のスペクトログラム画像をずらす
+        const specImg = ctx.getImageData(speed, 0, Math.floor(specW - speed), H);
+        ctx.putImageData(specImg, 0, 0);
+        ctx.fillStyle = '#000';
+        ctx.fillRect(specW - speed, 0, speed, H);
+
+        const logMin = Math.log10(20), logMax = Math.log10(20000);
+        const logRange = logMax - logMin;
+        const bars = 800; // 垂直解像度
+        for (let i = 0; i < bars; i++) {
+            const p = i / bars;
+            const f = Math.pow(10, logMin + p * logRange);
+            const b = Math.floor(f / (audioCtx.sampleRate / FFT_SIZE));
+            if (dataSpec[b] > 2) {
+                ctx.fillStyle = getRGB(dataSpec[b] / 255, preset);
+                ctx.fillRect(specW - speed, H - (p * H), speed, (H / bars) + 1);
+            }
+        }
+
+        // --- 2. WAVEFORM (高さ H 中央 80% 領域) ---
+        const xWave = specW;
+        ctx.fillStyle = '#050505';
+        ctx.fillRect(xWave, 0, waveW, H);
+        const dataWave = new Uint8Array(2048);
+        analyserL.getByteTimeDomainData(dataWave);
+        ctx.beginPath();
+        ctx.strokeStyle = getRGB(0.7, preset);
+        ctx.lineWidth = 2;
+        for(let i=0; i<dataWave.length; i++) {
+            const x = xWave + (i / dataWave.length) * waveW;
+            const y = (dataWave[i]/128-1)*H*0.45 + H/2; // 高さを揃える
+            if(i===0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        // --- 3. STEREO PHASE (正方形を高さ H に合わせて中央配置) ---
+        const xStereo = specW + waveW;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(xStereo, 0, stereoW, H);
+        
+        const dL = new Uint8Array(2048), dR = new Uint8Array(2048);
+        analyserL.getByteTimeDomainData(dL); analyserR.getByteTimeDomainData(dR);
+        
+        ctx.beginPath();
+        ctx.strokeStyle = getRGB(0.9, preset);
+        ctx.lineWidth = 1.2;
+        
+        const stereoMinSide = Math.min(stereoW, H);
+        const centerX = xStereo + stereoW / 2;
+        const centerY = H / 2;
+        const scale = stereoMinSide * 0.45; // 画面高さに対してバランス良く
+
+        for(let i=0; i<dL.length; i+=2) {
+            const l = dL[i]/128-1, r = dR[i]/128-1;
+            const x = (l - r) * scale + centerX;
+            const y = (l + r) * scale + centerY;
+            if(i===0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        // 境界線の描画（デザインのアクセント）
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(specW, 0, 1, H);
+        ctx.fillRect(specW + waveW, 0, 1, H);
+    }
+
+    document.getElementById('playBtn').onclick = () => start(false);
+    document.getElementById('recBtn').onclick = () => start(true);
+    document.getElementById('stopBtn').onclick = stop;
+</script>
+</body>
+</html>
