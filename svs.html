@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>MiniMeters Pro - Local Engine Fixed</title>
+    <style>
+        :root { --bg: #000; --accent: #00f2ff; --panel: #0a0a0a; --border: #1a1a1a; }
+        body { background: var(--bg); color: #fff; font-family: 'Segoe UI', sans-serif; margin: 0; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+        
+        #toolbar {
+            background: var(--panel); padding: 8px 15px; display: flex; gap: 15px; 
+            align-items: center; border-bottom: 2px solid var(--border);
+        }
+        .tool-group { display: flex; flex-direction: column; gap: 2px; }
+        .tool-group label { font-size: 8px; color: #444; font-weight: 900; text-transform: uppercase; }
+        
+        input[type="file"], select, button, input[type="range"] {
+            background: #111; border: 1px solid #333; color: #eee; padding: 4px 8px; font-size: 11px; outline: none;
+        }
+        button { cursor: pointer; font-weight: bold; min-width: 70px; border-radius: 2px; }
+        button.active { background: var(--accent); color: #000; border-color: var(--accent); }
+        button#recBtn.recording { background: #ff0044; color: #fff; border-color: #ff0044; animation: pulse 1s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        button:disabled { opacity: 0.1; }
+
+        #canvas-container { flex-grow: 1; background: #000; position: relative; width: 100vw; overflow: hidden; }
+        #masterCanvas { width: 100%; height: 100%; display: block; }
+        
+        #status { font-size: 10px; color: var(--accent); padding: 4px 10px; background: #000; border: 1px solid #111; font-family: monospace; min-width: 280px; }
+    </style>
+</head>
+<body>
+
+<div id="toolbar">
+    <div class="tool-group">
+        <label>1. Audio Source</label>
+        <input type="file" id="audioInput" accept="audio/wav,audio/mpeg,audio/flac,audio/mp4">
+    </div>
+    <div class="tool-group">
+        <label>2. Vis Speed</label>
+        <input type="range" id="speedRange" min="1" max="30" value="10">
+    </div>
+    <div class="tool-group">
+        <label>3. Palette</label>
+        <select id="colorSelect">
+            <option value="magma">MAGMA</option>
+            <option value="cyber">CYBER</option>
+            <option value="acid">ACID</option>
+            <option value="ice">FROZEN</option>
+        </select>
+    </div>
+    <div class="tool-group">
+        <label>4. Control</label>
+        <div style="display:flex; gap:4px;">
+            <button id="playBtn" disabled>PLAY</button>
+            <button id="recBtn" disabled>RECORD</button>
+            <button id="stopBtn" disabled>STOP</button>
+        </div>
+    </div>
+    <div id="status">STATUS // READY (SELECT WAV)</div>
+</div>
+
+<div id="canvas-container">
+    <canvas id="masterCanvas"></canvas>
+</div>
+
+<script>
+    const FFT_SIZE = 16384;
+    let audioCtx, source, analyserMono, analyserL, analyserR, animationId, mediaRecorder;
+    let audioBuffer = null;
+    let recordedChunks = [];
+    
+    const canvas = document.getElementById('masterCanvas');
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    const statusEl = document.getElementById('status');
+    const inputEl = document.getElementById('audioInput');
+
+    const palettes = {
+        magma: (v) => [v * 255, Math.pow(v, 3) * 180, Math.pow(v, 7) * 255],
+        cyber: (v) => [v * 255, Math.pow(v, 2) * 120, 255 - v * 150],
+        acid: (v) => [Math.pow(v, 6) * 200, v * 255, 0],
+        ice: (v) => [Math.pow(v, 4) * 150, Math.pow(v, 1.3) * 200, v * 255]
+    };
+
+    function getRGB(v, preset) {
+        const [r, g, b] = palettes[preset](Math.max(0, Math.min(1, v)));
+        return `rgb(${r|0},${g|0},${b|0})`;
+    }
+
+    // --- ローカルWAV読み込みの決定的修正 ---
+    inputEl.onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        statusEl.innerText = "STATUS // READING FILE...";
+        
+        // FileReaderを使用してローカルファイルをメモリに読み込む（fetchエラーを回避）
+        const reader = new FileReader();
+        
+        reader.onload = async (event) => {
+            try {
+                const arrayBuffer = event.target.result;
+                
+                // Chromeのポリシー対策: ユーザー操作の中でAudioContextを生成
+                if (!audioCtx) {
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+                }
+
+                statusEl.innerText = "STATUS // DECODING PCM DATA...";
+                
+                // 非同期デコード
+                audioCtx.decodeAudioData(arrayBuffer, (decoded) => {
+                    audioBuffer = decoded;
+                    statusEl.innerText = `READY // ${file.name.toUpperCase()}`;
+                    document.getElementById('playBtn').disabled = document.getElementById('recBtn').disabled = false;
+                    resize();
+                }, (error) => {
+                    statusEl.innerText = "STATUS // ERROR: DECODE FAILED";
+                    console.error("Decode Error:", error);
+                });
+
+            } catch (err) {
+                statusEl.innerText = "STATUS // FATAL ERROR";
+                console.error(err);
+            }
+        };
+
+        reader.onerror = () => {
+            statusEl.innerText = "STATUS // FILE READ ERROR";
+        };
+
+        reader.readAsArrayBuffer(file);
+    };
+
+    function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = canvas.clientWidth * dpr;
+        canvas.height = canvas.clientHeight * dpr;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    async function start(isRecording) {
+        if (!audioBuffer) return;
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        
+        source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+
+        analyserMono = audioCtx.createAnalyser();
+        analyserMono.fftSize = FFT_SIZE;
+        const splitter = audioCtx.createChannelSplitter(2);
+        analyserL = audioCtx.createAnalyser(); 
+        analyserR = audioCtx.createAnalyser();
+        analyserL.fftSize = analyserR.fftSize = 2048;
+
+        source.connect(analyserMono);
+        source.connect(splitter);
+        splitter.connect(analyserL, 0); splitter.connect(analyserR, 1);
+        
+        const streamDest = audioCtx.createMediaStreamDestination();
+        source.connect(streamDest);
+        source.connect(audioCtx.destination);
+
+        if (isRecording) {
+            recordedChunks = [];
+            const stream = canvas.captureStream(60);
+            stream.addTrack(streamDest.stream.getAudioTracks()[0]);
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 25000000 });
+            mediaRecorder.ondataavailable = e => recordedChunks.push(e.data);
+            mediaRecorder.onstop = () => {
+                const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `Studio_Master_${Date.now()}.webm`;
+                a.click();
+            };
+            mediaRecorder.start();
+            document.getElementById('recBtn').classList.add('recording');
+        }
+
+        source.start(0);
+        document.getElementById('stopBtn').disabled = false;
+        source.onended = stop;
+        render();
+    }
+
+    function stop() {
+        if (source) try { source.stop(); } catch(e){}
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+        document.getElementById('recBtn').classList.remove('recording');
+        cancelAnimationFrame(animationId);
+    }
+
+    function render() {
+        animationId = requestAnimationFrame(render);
+        const preset = document.getElementById('colorSelect').value;
+        const speed = parseInt(document.getElementById('speedRange').value);
+        const W = canvas.width;
+        const H = canvas.height;
+
+        const specW = W * 0.5;
+        const waveW = W * 0.25;
+        const stereoW = W * 0.25;
+
+        // SPECTROGRAM (GPU COPY)
+        ctx.globalCompositeOperation = 'copy';
+        ctx.drawImage(canvas, speed, 0, specW - speed, H, 0, 0, specW - speed, H);
+        ctx.globalCompositeOperation = 'source-over';
+
+        const dataSpec = new Uint8Array(analyserMono.frequencyBinCount);
+        analyserMono.getByteFrequencyData(dataSpec);
+        ctx.fillStyle = '#000';
+        ctx.fillRect(specW - speed, 0, speed, H);
+
+        const logMin = Math.log10(20), logMax = Math.log10(20000);
+        const bars = 600;
+        for (let i = 0; i < bars; i++) {
+            const p = i / bars;
+            const f = Math.pow(10, logMin + p * (logMax - logMin));
+            const b = (f / (audioCtx.sampleRate / FFT_SIZE)) | 0;
+            if (dataSpec[b] > 2) {
+                ctx.fillStyle = getRGB(dataSpec[b] / 255, preset);
+                ctx.fillRect(specW - speed, H - (p * H), speed, (H / bars) + 1);
+            }
+        }
+
+        // WAVEFORM & STEREO (RE-DRAW AREA)
+        ctx.fillStyle = '#000';
+        ctx.fillRect(specW, 0, waveW + stereoW, H);
+
+        const dataWave = new Uint8Array(2048);
+        analyserL.getByteTimeDomainData(dataWave);
+        ctx.beginPath(); ctx.strokeStyle = getRGB(0.7, preset); ctx.lineWidth = 1.5;
+        for(let i=0; i<dataWave.length; i++) {
+            const x = specW + (i / dataWave.length) * waveW;
+            const y = (dataWave[i]/128-1)*H*0.42 + H/2;
+            if(i===0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        const dL = new Uint8Array(2048), dR = new Uint8Array(2048);
+        analyserL.getByteTimeDomainData(dL); analyserR.getByteTimeDomainData(dR);
+        ctx.beginPath(); ctx.strokeStyle = getRGB(0.9, preset); ctx.lineWidth = 1;
+        const centerX = specW + waveW + stereoW / 2;
+        const centerY = H / 2;
+        const scale = Math.min(stereoW, H) * 0.45;
+        for(let i=0; i<dL.length; i+=2) {
+            const l = dL[i]/128-1, r = dR[i]/128-1;
+            ctx.lineTo((l - r) * scale + centerX, (l + r) * scale + centerY);
+        }
+        ctx.stroke();
+
+        ctx.fillStyle = '#111';
+        ctx.fillRect(specW, 0, 1, H);
+        ctx.fillRect(specW + waveW, 0, 1, H);
+    }
+
+    document.getElementById('playBtn').onclick = () => start(false);
+    document.getElementById('recBtn').onclick = () => start(true);
+    document.getElementById('stopBtn').onclick = stop;
+</script>
+</body>
+</html>
